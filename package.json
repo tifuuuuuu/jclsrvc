@@ -1,0 +1,10 @@
+{
+  "name": "jerrick-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Jerrick Cloud - deploy a web app and get a live URL. Web apps only for now.",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node server.js --check"
+  }
+}

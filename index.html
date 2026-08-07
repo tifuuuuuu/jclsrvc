@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jerrick App service - Jerrick Cloud</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --blue: #0078d4; --blue-dark: #106ebe; --bg: #faf9f8; --border: #edebe9;
+    --border2: #e1dfdd; --text: #323130; --muted: #605e5c; --link: #0078d4;
+    --ok: #107c10; --masthead: #0e1726;
+  }
+  body { font-family: "Segoe UI", -apple-system, system-ui, Roboto, Arial, sans-serif; color: var(--text); background: var(--bg); font-size: 13px; line-height: 1.4; }
+  a { color: var(--link); text-decoration: none; cursor: pointer; }
+  a:hover { text-decoration: underline; }
+  .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+
+  /* masthead */
+  .masthead { height: 48px; background: var(--masthead); color: #fff; display: flex; align-items: center; padding: 0 12px; gap: 14px; }
+  .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; cursor: pointer; }
+  .search { flex: 1; max-width: 560px; height: 30px; background: #fff; border-radius: 2px; display: flex; align-items: center; padding: 0 10px; color: #605e5c; font-size: 13px; }
+  .masthead .spacer { flex: 1; }
+  .masthead .icons { display: flex; align-items: center; gap: 4px; }
+  .masthead .icons span { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 2px; cursor: pointer; }
+  .masthead .icons span:hover { background: rgba(255,255,255,.1); }
+  .avatar { width: 30px; height: 30px; border-radius: 50%; background: #5c2d91; color: #fff; display: grid; place-items: center; font-size: 12px; font-weight: 600; margin-left: 6px; }
+
+  .breadcrumb { padding: 8px 16px; font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; background: #fff; border-bottom: 1px solid var(--border); }
+  .breadcrumb .cur { color: var(--text); }
+
+  /* list screen */
+  .page { padding: 16px 24px; }
+  .list-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  .list-head h1 { font-size: 22px; font-weight: 600; }
+  .list-head .sub { color: var(--muted); margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; background: #fff; font-size: 13px; border: 1px solid var(--border2); }
+  th { text-align: left; font-weight: 600; color: var(--muted); padding: 9px 12px; border-bottom: 1px solid var(--border2); background: #faf9f8; }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  tr:hover td { background: #f7f6f5; }
+  .empty { text-align: center; padding: 56px 20px; color: var(--muted); border: 2px dashed var(--border2); border-radius: 4px; background: #fff; }
+  .empty h3 { color: var(--text); font-size: 16px; margin-bottom: 6px; }
+
+  .status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 11px; font-size: 12px; font-weight: 600; text-transform: capitalize; }
+  .status-badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .s-running { background: #dff6dd; color: #107c10; }
+  .s-stopped { background: #f3f2f1; color: #605e5c; }
+  .s-building, .s-queued { background: #deecf9; color: #0078d4; }
+  .s-failed { background: #fde7e9; color: #a4262c; }
+
+  /* buttons */
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 16px; font-size: 13px; border-radius: 2px; cursor: pointer; border: 1px solid var(--border2); background: #fff; color: var(--text); font-family: inherit; }
+  .btn.primary { background: var(--blue); color: #fff; border-color: var(--blue); }
+  .btn.primary:hover { background: var(--blue-dark); }
+  .btn:hover { background: #f3f2f1; }
+  .btn.primary:hover { background: var(--blue-dark); }
+
+  /* app-detail */
+  .res-header { background: #fff; padding: 10px 16px 0; }
+  .res-title { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .res-title .ico { width: 32px; height: 32px; border-radius: 4px; display: grid; place-items: center; background: linear-gradient(135deg, #50e6ff, #0078d4); }
+  .res-title h1 { font-size: 20px; font-weight: 600; }
+  .res-title .sub { font-size: 12px; color: var(--muted); }
+  .toolbar { display: flex; gap: 2px; flex-wrap: wrap; padding-bottom: 8px; border-bottom: 1px solid var(--border); overflow-x: auto; }
+  .tb-btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; font-size: 13px; color: var(--text); background: none; border: none; cursor: pointer; white-space: nowrap; border-radius: 2px; }
+  .tb-btn:hover { background: #f3f2f1; }
+  .tb-btn:disabled { opacity: .4; cursor: default; }
+  .tb-btn.danger { color: #a4262c; }
+
+  .layout { display: flex; min-height: calc(100vh - 48px); }
+  .nav { width: 250px; background: #fff; border-right: 1px solid var(--border); padding: 8px 0; flex-shrink: 0; overflow-y: auto; }
+  .nav-group { font-size: 11px; color: var(--muted); padding: 8px 16px 4px; font-weight: 600; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 6px 16px; cursor: pointer; font-size: 13px; color: var(--text); border-left: 3px solid transparent; }
+  .nav-item:hover { background: #f3f2f1; }
+  .nav-item.active { background: #edebe9; border-left-color: var(--blue); font-weight: 600; }
+  .nav-item svg { fill: var(--muted); flex-shrink: 0; }
+
+  .content { flex: 1; padding: 16px 24px; overflow-x: auto; min-width: 0; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  h2.blade-h { font-size: 16px; font-weight: 600; margin-bottom: 12px; }
+  .desc { color: var(--muted); margin-bottom: 16px; max-width: 780px; }
+  .card { background: #fff; border: 1px solid var(--border2); border-radius: 2px; padding: 16px; margin-bottom: 16px; }
+  .essentials { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 4px 48px; }
+  .kv { display: flex; padding: 3px 0; font-size: 13px; }
+  .kv .k { color: var(--muted); width: 150px; flex-shrink: 0; }
+  .info-bar { background: #eff6fc; border-left: 3px solid var(--blue); padding: 10px 14px; margin-bottom: 16px; }
+
+  .console { background: #1e1e1e; color: #d4d4d4; font-family: Consolas, monospace; font-size: 12px; padding: 14px; border-radius: 2px; line-height: 1.6; height: 62vh; overflow: auto; white-space: pre-wrap; }
+  .console div { min-height: 1.2em; }
+
+  /* create modal */
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; align-items: flex-start; justify-content: center; z-index: 50; }
+  .modal { background: #fff; margin-top: 72px; width: 480px; max-width: 92vw; border-radius: 4px; box-shadow: 0 8px 30px rgba(0,0,0,.3); overflow: hidden; }
+  .modal-h { padding: 14px 20px; font-size: 16px; font-weight: 600; background: var(--masthead); color: #fff; }
+  .modal-b { padding: 20px; }
+  .modal-f { padding: 14px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; }
+  .field { margin-bottom: 16px; }
+  .field label { display: block; font-weight: 600; margin-bottom: 4px; }
+  .field input { width: 100%; height: 32px; border: 1px solid var(--border2); border-radius: 2px; padding: 0 10px; font-family: inherit; font-size: 13px; }
+  .field .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .err { color: #a4262c; font-size: 12px; min-height: 16px; }
+
+  .source-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .source { border: 1px solid var(--border2); border-radius: 2px; padding: 14px; text-align: center; background: #fff; }
+  .source.sel { border-color: var(--blue); border-width: 2px; background: #f3f9fd; }
+  .source .s-ico { font-size: 24px; margin-bottom: 6px; }
+</style>
+</head>
+<body>
+
+<div class="masthead">
+  <div class="logo" onclick="showList()">
+    <svg width="22" height="22" viewBox="0 0 24 24"><defs><linearGradient id="jg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#50e6ff"/><stop offset="1" stop-color="#0078d4"/></linearGradient></defs><rect x="2" y="2" width="20" height="20" rx="4" fill="url(#jg)"/><text x="12" y="17" font-size="13" font-weight="700" text-anchor="middle" fill="#fff" font-family="Segoe UI, sans-serif">J</text></svg>
+    Jerrick Cloud
+  </div>
+  <div class="search">🔍&nbsp; Search resources, services, and docs</div>
+  <div class="spacer"></div>
+  <div class="icons">
+    <span title="Cloud Shell">&gt;_</span><span title="Notifications">🔔</span><span title="Settings">⚙️</span><span title="Help">❓</span>
+    <div class="avatar" id="me" title="jerrickjamesdecena@gmail.com">JD</div>
+  </div>
+</div>
+
+<!-- ===================== LIST SCREEN ===================== -->
+<div id="screen-list">
+  <div class="breadcrumb"><a onclick="showList()">Home</a> <span>&gt;</span> <span class="cur">App Services</span></div>
+  <div class="page">
+    <div class="list-head">
+      <div>
+        <h1>App Services</h1>
+        <div class="sub">Web apps deployed to Jerrick Cloud</div>
+      </div>
+      <button class="btn primary" onclick="openCreate()">＋ Create web app</button>
+    </div>
+
+    <div id="empty" class="empty" style="display:none">
+      <h3>No web apps yet</h3>
+      <div>Deploy a Node web app from a Git repo or a local folder to get started.</div>
+      <div style="margin-top:14px"><button class="btn primary" onclick="openCreate()">＋ Create your first web app</button></div>
+    </div>
+
+    <table id="apps-table" style="display:none">
+      <thead><tr><th>Name</th><th>Status</th><th>URL</th><th>Source</th><th>Created</th></tr></thead>
+      <tbody id="apps-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ===================== APP DETAIL SCREEN ===================== -->
+<div id="screen-app" style="display:none">
+  <div class="breadcrumb"><a onclick="showList()">Home</a> <span>&gt;</span> <a onclick="showList()">App Services</a> <span>&gt;</span> <span class="cur" id="app-crumb"></span></div>
+
+  <div class="res-header">
+    <div class="res-title">
+      <div class="ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="#fff"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5zm0 2.3 6.5 3.6L12 11.5 5.5 7.9 12 4.3zM5 9.6l6 3.3v6.8l-6-3.3V9.6zm14 0v6.8l-6 3.3v-6.8l6-3.3z"/></svg></div>
+      <div><h1 id="app-name"></h1><div class="sub">Web App · Jerrick Cloud</div></div>
+    </div>
+    <div class="toolbar" id="app-toolbar"></div>
+  </div>
+
+  <div class="layout">
+    <nav class="nav">
+      <div class="nav-group">Overview</div>
+      <div class="nav-item active" data-panel="overview"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M3 3h8v8H3zm10 0h8v5h-8zm0 7h8v11h-8zM3 13h8v8H3z"/></svg>Overview</div>
+      <div class="nav-group">Deployment</div>
+      <div class="nav-item" data-panel="deployment"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M12 2 4 6v6c0 5 3.4 9.7 8 10 4.6-.3 8-5 8-10V6l-8-4z"/></svg>Deployment Center</div>
+      <div class="nav-group">Settings</div>
+      <div class="nav-item" data-panel="config"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm9 4-2 3 1 3-3 1-2 3h-4l-2-3-3-1 1-3-2-3 2-3-1-3 3-1 2-3h4l2 3 3 1-1 3z"/></svg>Configuration</div>
+      <div class="nav-item" data-panel="scale"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M4 20V10h4v10zm6 0V4h4v16zm6 0v-7h4v7z"/></svg>Scale up (plan)</div>
+      <div class="nav-item" data-panel="domains"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2c1.7 0 3.9 3.2 4 8H8c.1-4.8 2.3-8 4-8zm0 16c-1.7 0-3.9-3.2-4-8h8c-.1 4.8-2.3 8-4 8z"/></svg>Custom domains</div>
+      <div class="nav-group">Monitoring</div>
+      <div class="nav-item" data-panel="logstream"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M4 5h16v3H4zm0 5h16v3H4zm0 5h10v3H4z"/></svg>Log stream</div>
+    </nav>
+
+    <main class="content">
+      <!-- Overview -->
+      <section class="panel active" id="p-overview">
+        <div class="card">
+          <div class="essentials">
+            <div class="kv"><span class="k">Status</span><span class="v" id="ov-status"></span></div>
+            <div class="kv"><span class="k">URL</span><span class="v" id="ov-url"></span></div>
+            <div class="kv"><span class="k">Source</span><span class="v mono" id="ov-source"></span></div>
+            <div class="kv"><span class="k">Source type</span><span class="v" id="ov-type"></span></div>
+            <div class="kv"><span class="k">Port</span><span class="v mono" id="ov-port"></span></div>
+            <div class="kv"><span class="k">Created</span><span class="v" id="ov-created"></span></div>
+            <div class="kv"><span class="k">Runtime stack</span><span class="v">Node (npm start)</span></div>
+            <div class="kv"><span class="k">Region</span><span class="v">Local · Jerrick Cloud</span></div>
+          </div>
+        </div>
+        <div class="info-bar">Jerrick Cloud runs <b class="mono">npm install</b> then <b class="mono">npm start</b> with <b class="mono">PORT</b> injected. Your app must listen on <b class="mono">process.env.PORT</b>. Watch it happen live under <a onclick="selectPanel('logstream')">Log stream</a>.</div>
+      </section>
+
+      <!-- Deployment Center -->
+      <section class="panel" id="p-deployment">
+        <h2 class="blade-h">Deployment Center</h2>
+        <p class="desc">Jerrick Cloud pulls your code, installs dependencies, and starts your web app.</p>
+        <div class="source-grid">
+          <div class="source sel"><div class="s-ico">🐙</div><div>Git</div></div>
+          <div class="source"><div class="s-ico">📁</div><div>Local folder</div></div>
+          <div class="source" style="opacity:.4"><div class="s-ico">📤</div><div>Zip upload</div></div>
+        </div>
+        <div class="card" style="max-width:640px">
+          <div class="kv"><span class="k">Source</span><span class="v mono" id="dep-source"></span></div>
+          <div class="kv"><span class="k">Build command</span><span class="v mono">npm install</span></div>
+          <div class="kv"><span class="k">Start command</span><span class="v mono">npm start</span></div>
+          <div style="margin-top:14px; display:flex; gap:8px">
+            <button class="btn primary" onclick="act('redeploy'); selectPanel('logstream')">⬆ Redeploy</button>
+            <button class="btn" onclick="selectPanel('logstream')">View build logs</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Configuration (static for now) -->
+      <section class="panel" id="p-config">
+        <h2 class="blade-h">Configuration</h2>
+        <p class="desc">Environment variables passed to your app at runtime. <span class="muted">(Editing coming soon — PORT is injected automatically.)</span></p>
+        <table>
+          <thead><tr><th>Name</th><th>Value</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">PORT</td><td class="mono">&lt;assigned by Jerrick Cloud&gt;</td></tr>
+            <tr><td class="mono">NODE_ENV</td><td class="mono">production</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- Scale (static) -->
+      <section class="panel" id="p-scale">
+        <h2 class="blade-h">Scale up (plan)</h2>
+        <p class="desc">Pricing tiers are cosmetic for now — every app runs on your local machine.</p>
+        <div class="info-bar">Current tier: <b>Local (Free)</b> — runs as a child process on this machine.</div>
+      </section>
+
+      <!-- Domains (static) -->
+      <section class="panel" id="p-domains">
+        <h2 class="blade-h">Custom domains</h2>
+        <p class="desc">Jerrick Cloud's built-in reverse proxy gives every running app a subdomain. Bring-your-own custom domains are the next milestone.</p>
+        <table><thead><tr><th>Domain</th><th>Status</th></tr></thead><tbody id="dom-tbody"></tbody></table>
+      </section>
+
+      <!-- Log stream (live) -->
+      <section class="panel" id="p-logstream">
+        <h2 class="blade-h">Log stream</h2>
+        <p class="desc">Live build and runtime output, streamed from the server.</p>
+        <div class="console" id="console"></div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- Create modal -->
+<div class="overlay" id="create-modal">
+  <form class="modal" onsubmit="submitCreate(event)">
+    <div class="modal-h">Create web app</div>
+    <div class="modal-b">
+      <div class="field">
+        <label>App name</label>
+        <input id="c-name" placeholder="my-web-app" autocomplete="off" required>
+        <div class="hint">Lowercased and slugified. Must be unique.</div>
+      </div>
+      <div class="field">
+        <label>Source</label>
+        <input id="c-source" placeholder="https://github.com/you/repo  —or—  C:\path\to\app" autocomplete="off" required>
+        <div class="hint">A Git URL (cloned) or a local folder path (run in place). Must be a Node app with an <span class="mono">npm start</span> script.</div>
+      </div>
+      <div class="field">
+        <label>Access token <span class="muted" style="font-weight:400">— optional, for private GitHub repos</span></label>
+        <input id="c-token" type="password" placeholder="ghp_… or github_pat_…" autocomplete="off">
+        <div class="hint">A GitHub <a href="https://github.com/settings/tokens" target="_blank">personal access token</a> with <span class="mono">repo</span> (or Contents: read) access. Used only to clone — Jerrick never stores it.</div>
+      </div>
+      <div class="err" id="c-error"></div>
+    </div>
+    <div class="modal-f">
+      <button type="button" class="btn" onclick="closeCreate()">Cancel</button>
+      <button type="submit" class="btn primary">Deploy</button>
+    </div>
+  </form>
+</div>
+
+<script>
+  const $ = s => document.querySelector(s);
+  let es = null;          // SSE connection
+  let currentName = null; // open app
+
+  const badge = s => `<span class="status-badge s-${s}">${s}</span>`;
+  const api = (p, opts) => fetch('/api/apps' + p, opts).then(r => r.json());
+
+  // ---------- auth (avatar shows the signed-in Google user; click to sign out) ----------
+  fetch('/api/me').then(r => r.json()).then(m => {
+    if (!m.auth || !m.email) return;   // login disabled -> keep the static avatar
+    const el = $('#me'); if (!el) return;
+    el.title = `${m.email} — click to sign out`;
+    el.textContent = (m.email[0] || '?').toUpperCase();
+    el.style.cursor = 'pointer';
+    el.onclick = () => { if (confirm('Sign out of Jerrick Cloud?')) location.href = '/auth/logout'; };
+  }).catch(() => {});
+
+  // ---------- list screen ----------
+  async function showList() {
+    if (es) { es.close(); es = null; }
+    currentName = null;
+    $('#screen-app').style.display = 'none';
+    $('#screen-list').style.display = 'block';
+    const apps = await api('');
+    const tb = $('#apps-tbody'); tb.innerHTML = '';
+    $('#empty').style.display = apps.length ? 'none' : 'block';
+    $('#apps-table').style.display = apps.length ? 'table' : 'none';
+    for (const a of apps) {
+      const tr = document.createElement('tr');
+      tr.style.cursor = 'pointer';
+      tr.innerHTML =
+        `<td><a>${a.name}</a></td>` +
+        `<td>${badge(a.status)}</td>` +
+        `<td>${a.url ? `<a href="${a.url}" target="_blank" onclick="event.stopPropagation()">${a.url}</a>` : '<span class="muted">—</span>'}</td>` +
+        `<td class="mono">${a.source}</td>` +
+        `<td>${a.createdAt ? new Date(a.createdAt).toLocaleString() : ''}</td>`;
+      tr.onclick = () => showApp(a.name);
+      tb.appendChild(tr);
+    }
+  }
+
+  // ---------- app detail ----------
+  async function showApp(name) {
+    const a = await api('/' + name);
+    if (a.error) return showList();
+    $('#screen-list').style.display = 'none';
+    $('#screen-app').style.display = 'block';
+    renderApp(a);
+    selectPanel('overview');
+    connectLogs(name);
+  }
+
+  function renderApp(a) {
+    $('#app-name').textContent = a.name;
+    $('#app-crumb').textContent = a.name;
+    $('#ov-status').innerHTML = badge(a.status);
+    $('#ov-url').innerHTML = a.url && a.status === 'running'
+      ? `<a href="${a.url}" target="_blank">${a.url}</a>`
+      : '<span class="muted">— (app not running)</span>';
+    $('#ov-source').textContent = a.source;
+    $('#ov-type').textContent = a.managed ? 'Git repository (cloned)' : 'Local folder (in place)';
+    $('#ov-port').textContent = a.port || '—';
+    $('#ov-created').textContent = a.createdAt ? new Date(a.createdAt).toLocaleString() : '';
+    $('#dep-source').textContent = a.source;
+    $('#dom-tbody').innerHTML = a.url && a.status === 'running'
+      ? `<tr><td class="mono">${a.url.replace('http://', '')}</td><td>${badge(a.status)}</td></tr>` +
+        `<tr><td class="mono">localhost:${a.port} <span class="muted">(direct)</span></td><td>${badge(a.status)}</td></tr>`
+      : `<tr><td colspan="2" class="muted">App not running.</td></tr>`;
+    renderToolbar(a);
+  }
+
+  function renderToolbar(a) {
+    const running = a.status === 'running';
+    const busy = a.status === 'building' || a.status === 'queued';
+    const tb = (action, label, disabled) =>
+      `<button class="tb-btn" ${disabled ? 'disabled' : ''} onclick="act('${action}')">${label}</button>`;
+    let html = running
+      ? `<a class="tb-btn" href="${a.url}" target="_blank">▶ Browse</a>`
+      : `<button class="tb-btn" disabled>▶ Browse</button>`;
+    html += running ? tb('stop', '⏹ Stop') : tb('start', '▶ Start', busy);
+    html += tb('restart', '🔁 Restart', busy);
+    html += tb('redeploy', '⬆ Redeploy', busy);
+    html += `<button class="tb-btn danger" onclick="delApp('${a.name}')">🗑 Delete</button>`;
+    $('#app-toolbar').innerHTML = html;
+  }
+
+  async function act(action) {
+    await fetch(`/api/apps/${currentName}/${action}`, { method: 'POST' });
+    setTimeout(refresh, 400); // status also arrives via SSE
+  }
+  async function delApp(name) {
+    if (!confirm(`Delete "${name}"? This stops the app and removes it from Jerrick Cloud.`)) return;
+    await fetch('/api/apps/' + name, { method: 'DELETE' });
+    showList();
+  }
+  async function refresh() {
+    if (!currentName) return;
+    const a = await api('/' + currentName);
+    if (!a.error) renderApp(a);
+  }
+
+  // ---------- logs (SSE) ----------
+  function connectLogs(name) {
+    currentName = name;
+    if (es) es.close();
+    $('#console').innerHTML = '';
+    es = new EventSource('/api/apps/' + name + '/logs');
+    es.onmessage = e => appendLog(e.data);
+    es.addEventListener('status', () => refresh());
+  }
+  function appendLog(line) {
+    const c = $('#console');
+    const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 40;
+    const div = document.createElement('div');
+    div.textContent = line;
+    c.appendChild(div);
+    if (atBottom) c.scrollTop = c.scrollHeight;
+  }
+
+  // ---------- panels ----------
+  function selectPanel(panel) {
+    document.querySelectorAll('#screen-app .nav-item').forEach(n => n.classList.toggle('active', n.dataset.panel === panel));
+    document.querySelectorAll('#screen-app .panel').forEach(p => p.classList.remove('active'));
+    const el = document.getElementById('p-' + panel);
+    if (el) el.classList.add('active');
+  }
+  document.addEventListener('click', e => {
+    const item = e.target.closest('#screen-app .nav-item');
+    if (item) selectPanel(item.dataset.panel);
+  });
+
+  // ---------- create ----------
+  function openCreate() { $('#c-error').textContent = ''; $('#create-modal').style.display = 'flex'; $('#c-name').focus(); }
+  function closeCreate() { $('#create-modal').style.display = 'none'; }
+  async function submitCreate(ev) {
+    ev.preventDefault();
+    const r = await fetch('/api/apps', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: $('#c-name').value, source: $('#c-source').value, token: $('#c-token').value })
+    });
+    const a = await r.json();
+    if (a.error) { $('#c-error').textContent = a.error; return; }
+    $('#c-name').value = ''; $('#c-source').value = ''; $('#c-token').value = '';
+    closeCreate();
+    await showApp(a.name);
+    selectPanel('logstream'); // watch it build & start
+  }
+
+  showList();
+</script>
+</body>
+</html>

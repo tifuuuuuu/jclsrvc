@@ -1,0 +1,14 @@
+# dependencies
+node_modules/
+
+# runtime state (regenerated at run time; machine-specific paths)
+apps.json
+
+# git clones of deployed apps
+workspaces/
+
+# editor / IDE
+.vs/
+
+# personal Claude Code settings (machine-specific)
+.claude/settings.local.json
