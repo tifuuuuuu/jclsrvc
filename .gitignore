@@ -1,6 +1,9 @@
 # dependencies
 node_modules/
 
+# secrets (Google OAuth credentials)
+.env
+
 # runtime state (regenerated at run time; machine-specific paths)
 apps.json
 

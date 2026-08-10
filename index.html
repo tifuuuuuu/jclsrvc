@@ -3,175 +3,278 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Jerrick App service - Jerrick Cloud</title>
+<title>Jerrick Cloud · App Service</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  /* ---- dark-first design tokens (light fallback below) ---- */
   :root {
-    --blue: #0078d4; --blue-dark: #106ebe; --bg: #faf9f8; --border: #edebe9;
-    --border2: #e1dfdd; --text: #323130; --muted: #605e5c; --link: #0078d4;
-    --ok: #107c10; --masthead: #0e1726;
+    color-scheme: dark;
+    --bg: #0a0d14; --surface: #111621; --surface-2: #161c29; --surface-3: #1d2534;
+    --border: #232c3d; --border-2: #2e3a4f;
+    --text: #e7ebf3; --muted: #98a2b3; --faint: #6b7688;
+    --accent: #5b8cff; --grad: linear-gradient(135deg, #38bdf8, #5b8cff 45%, #7c5cff);
+    --ok: #34d399; --ok-bg: rgba(52,211,153,.13);
+    --info: #60a5fa; --info-bg: rgba(96,165,250,.13);
+    --bad: #f87171; --bad-bg: rgba(248,113,113,.15);
+    --stop: #94a3b8; --stop-bg: rgba(148,163,184,.13);
+    --r: 14px; --r-sm: 9px;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,.35);
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 14px 34px -14px rgba(0,0,0,.65);
+    --ring: 0 0 0 3px rgba(91,140,255,.30);
+    --maxw: 1120px;
   }
-  body { font-family: "Segoe UI", -apple-system, system-ui, Roboto, Arial, sans-serif; color: var(--text); background: var(--bg); font-size: 13px; line-height: 1.4; }
-  a { color: var(--link); text-decoration: none; cursor: pointer; }
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --bg: #f4f6fb; --surface: #ffffff; --surface-2: #f7f9fc; --surface-3: #eef2f8;
+      --border: #e6ebf3; --border-2: #d7deea;
+      --text: #111827; --muted: #5b6472; --faint: #8a93a3;
+      --accent: #3b6ef5; --grad: linear-gradient(135deg, #22b8e6, #3b6ef5 45%, #6d4bff);
+      --ok: #0f9d58; --ok-bg: rgba(15,157,88,.12);
+      --info: #2563eb; --info-bg: rgba(37,99,235,.10);
+      --bad: #dc2626; --bad-bg: rgba(220,38,38,.10);
+      --stop: #64748b; --stop-bg: rgba(100,116,139,.12);
+      --shadow-sm: 0 1px 3px rgba(16,24,40,.06);
+      --shadow: 0 1px 2px rgba(16,24,40,.06), 0 14px 30px -16px rgba(16,24,40,.28);
+      --ring: 0 0 0 3px rgba(59,110,245,.22);
+    }
+  }
+
+  body { font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+         background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5;
+         -webkit-font-smoothing: antialiased; min-height: 100vh; }
+  a { color: var(--accent); text-decoration: none; cursor: pointer; }
   a:hover { text-decoration: underline; }
-  .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+  .mono { font-family: "SFMono-Regular", ui-monospace, Consolas, "Courier New", monospace; font-size: .86em; }
   .muted { color: var(--muted); }
+  .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  ::selection { background: rgba(91,140,255,.35); }
 
-  /* masthead */
-  .masthead { height: 48px; background: var(--masthead); color: #fff; display: flex; align-items: center; padding: 0 12px; gap: 14px; }
-  .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; cursor: pointer; }
-  .search { flex: 1; max-width: 560px; height: 30px; background: #fff; border-radius: 2px; display: flex; align-items: center; padding: 0 10px; color: #605e5c; font-size: 13px; }
-  .masthead .spacer { flex: 1; }
-  .masthead .icons { display: flex; align-items: center; gap: 4px; }
-  .masthead .icons span { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 2px; cursor: pointer; }
-  .masthead .icons span:hover { background: rgba(255,255,255,.1); }
-  .avatar { width: 30px; height: 30px; border-radius: 50%; background: #5c2d91; color: #fff; display: grid; place-items: center; font-size: 12px; font-weight: 600; margin-left: 6px; }
+  /* ---- topbar ---- */
+  .topbar { position: sticky; top: 0; z-index: 20; height: 60px; display: flex; align-items: center; gap: 16px;
+            padding: 0 20px; background: var(--surface); border-bottom: 1px solid var(--border); }
+  .logo { display: flex; align-items: center; gap: 11px; font-weight: 650; font-size: 16px; letter-spacing: -.01em;
+          color: var(--text); cursor: pointer; }
+  .logo .mark { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; background: var(--grad);
+                color: #fff; font-weight: 800; font-size: 15px; box-shadow: 0 5px 14px -5px rgba(91,140,255,.7); }
+  .topbar .spacer { flex: 1; }
+  .avatar { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font-size: 13px;
+            font-weight: 650; color: #fff; background: var(--grad); user-select: none; box-shadow: var(--shadow-sm); }
 
-  .breadcrumb { padding: 8px 16px; font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; background: #fff; border-bottom: 1px solid var(--border); }
-  .breadcrumb .cur { color: var(--text); }
+  /* ---- buttons ---- */
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 38px; padding: 0 16px;
+         font-size: 13.5px; font-weight: 600; border-radius: var(--r-sm); border: 1px solid var(--border-2);
+         background: var(--surface-2); color: var(--text); cursor: pointer; font-family: inherit;
+         transition: background .15s, border-color .15s, filter .15s, transform .05s; }
+  .btn:hover { background: var(--surface-3); }
+  .btn:active { transform: translateY(1px); }
+  .btn:focus-visible { outline: none; box-shadow: var(--ring); }
+  .btn.primary { border: 0; color: #fff; background: var(--grad); box-shadow: 0 7px 18px -7px rgba(91,140,255,.75); }
+  .btn.primary:hover { filter: brightness(1.08); }
 
-  /* list screen */
-  .page { padding: 16px 24px; }
-  .list-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
-  .list-head h1 { font-size: 22px; font-weight: 600; }
-  .list-head .sub { color: var(--muted); margin-bottom: 16px; }
-  table { width: 100%; border-collapse: collapse; background: #fff; font-size: 13px; border: 1px solid var(--border2); }
-  th { text-align: left; font-weight: 600; color: var(--muted); padding: 9px 12px; border-bottom: 1px solid var(--border2); background: #faf9f8; }
-  td { padding: 9px 12px; border-bottom: 1px solid var(--border); }
-  tr:hover td { background: #f7f6f5; }
-  .empty { text-align: center; padding: 56px 20px; color: var(--muted); border: 2px dashed var(--border2); border-radius: 4px; background: #fff; }
-  .empty h3 { color: var(--text); font-size: 16px; margin-bottom: 6px; }
+  /* ---- breadcrumb ---- */
+  .breadcrumb { max-width: var(--maxw); margin: 0 auto; padding: 16px 24px 0; font-size: 12.5px; color: var(--muted);
+                display: flex; gap: 8px; align-items: center; }
+  .breadcrumb .sep { opacity: .5; }
+  .breadcrumb .cur { color: var(--text); font-weight: 550; }
 
-  .status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 11px; font-size: 12px; font-weight: 600; text-transform: capitalize; }
+  /* ---- list screen ---- */
+  .page { max-width: var(--maxw); margin: 0 auto; padding: 24px; }
+  .list-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 22px; }
+  .list-head h1 { font-size: 26px; font-weight: 700; letter-spacing: -.02em; }
+  .list-head .sub { color: var(--muted); margin-top: 4px; }
+
+  .apps-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+  .app-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); padding: 18px;
+              cursor: pointer; display: flex; flex-direction: column; gap: 14px; box-shadow: var(--shadow-sm);
+              transition: transform .18s, box-shadow .18s, border-color .18s; }
+  .app-card:hover { transform: translateY(-2px); box-shadow: var(--shadow); border-color: var(--border-2); }
+  .app-card-top { display: flex; align-items: center; gap: 12px; }
+  .app-ico { width: 38px; height: 38px; border-radius: 10px; background: var(--grad); display: grid; place-items: center;
+             flex-shrink: 0; box-shadow: 0 5px 14px -6px rgba(91,140,255,.7); }
+  .app-ico svg { width: 20px; height: 20px; }
+  .app-card-name { font-weight: 650; font-size: 15px; flex: 1; min-width: 0; }
+  .app-card-meta { font-size: 12.5px; color: var(--muted); }
+  .app-card-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+                   padding-top: 13px; border-top: 1px solid var(--border); font-size: 12.5px; }
+
+  .empty { text-align: center; padding: 64px 24px; border: 1px dashed var(--border-2); border-radius: var(--r);
+           background: var(--surface); color: var(--muted); }
+  .empty .e-ico { font-size: 34px; margin-bottom: 12px; }
+  .empty h3 { color: var(--text); font-size: 18px; font-weight: 650; margin-bottom: 6px; }
+  .empty .btn { margin-top: 18px; }
+
+  /* ---- status badge ---- */
+  .status-badge { display: inline-flex; align-items: center; gap: 7px; padding: 3px 11px 3px 9px; border-radius: 999px;
+                  font-size: 12px; font-weight: 650; text-transform: capitalize; }
   .status-badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-  .s-running { background: #dff6dd; color: #107c10; }
-  .s-stopped { background: #f3f2f1; color: #605e5c; }
-  .s-building, .s-queued { background: #deecf9; color: #0078d4; }
-  .s-failed { background: #fde7e9; color: #a4262c; }
+  .s-running { background: var(--ok-bg); color: var(--ok); }
+  .s-running::before { animation: pulse 1.8s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(52,211,153,.5); } 70% { box-shadow: 0 0 0 6px rgba(52,211,153,0); } 100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); } }
+  .s-stopped { background: var(--stop-bg); color: var(--stop); }
+  .s-building, .s-queued { background: var(--info-bg); color: var(--info); }
+  .s-failed { background: var(--bad-bg); color: var(--bad); }
 
-  /* buttons */
-  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 16px; font-size: 13px; border-radius: 2px; cursor: pointer; border: 1px solid var(--border2); background: #fff; color: var(--text); font-family: inherit; }
-  .btn.primary { background: var(--blue); color: #fff; border-color: var(--blue); }
-  .btn.primary:hover { background: var(--blue-dark); }
-  .btn:hover { background: #f3f2f1; }
-  .btn.primary:hover { background: var(--blue-dark); }
-
-  /* app-detail */
-  .res-header { background: #fff; padding: 10px 16px 0; }
-  .res-title { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-  .res-title .ico { width: 32px; height: 32px; border-radius: 4px; display: grid; place-items: center; background: linear-gradient(135deg, #50e6ff, #0078d4); }
-  .res-title h1 { font-size: 20px; font-weight: 600; }
-  .res-title .sub { font-size: 12px; color: var(--muted); }
-  .toolbar { display: flex; gap: 2px; flex-wrap: wrap; padding-bottom: 8px; border-bottom: 1px solid var(--border); overflow-x: auto; }
-  .tb-btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; font-size: 13px; color: var(--text); background: none; border: none; cursor: pointer; white-space: nowrap; border-radius: 2px; }
-  .tb-btn:hover { background: #f3f2f1; }
+  /* ---- app detail: header ---- */
+  .res-header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 20px 24px 0; }
+  .res-wrap { max-width: var(--maxw); margin: 0 auto; }
+  .res-title { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+  .res-title .ico { width: 46px; height: 46px; border-radius: 12px; background: var(--grad); display: grid; place-items: center;
+                    box-shadow: 0 6px 16px -6px rgba(91,140,255,.7); }
+  .res-title h1 { font-size: 22px; font-weight: 700; letter-spacing: -.01em; }
+  .res-title .sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; padding-bottom: 16px; overflow-x: auto; }
+  .tb-btn { display: inline-flex; align-items: center; gap: 7px; height: 36px; padding: 0 14px; font-size: 13px; font-weight: 600;
+            color: var(--text); background: var(--surface-2); border: 1px solid var(--border-2); border-radius: 999px;
+            cursor: pointer; white-space: nowrap; font-family: inherit; transition: background .15s, opacity .15s; }
+  .tb-btn:hover { background: var(--surface-3); }
   .tb-btn:disabled { opacity: .4; cursor: default; }
-  .tb-btn.danger { color: #a4262c; }
+  .tb-btn.danger { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
 
-  .layout { display: flex; min-height: calc(100vh - 48px); }
-  .nav { width: 250px; background: #fff; border-right: 1px solid var(--border); padding: 8px 0; flex-shrink: 0; overflow-y: auto; }
-  .nav-group { font-size: 11px; color: var(--muted); padding: 8px 16px 4px; font-weight: 600; }
-  .nav-item { display: flex; align-items: center; gap: 10px; padding: 6px 16px; cursor: pointer; font-size: 13px; color: var(--text); border-left: 3px solid transparent; }
-  .nav-item:hover { background: #f3f2f1; }
-  .nav-item.active { background: #edebe9; border-left-color: var(--blue); font-weight: 600; }
-  .nav-item svg { fill: var(--muted); flex-shrink: 0; }
-
-  .content { flex: 1; padding: 16px 24px; overflow-x: auto; min-width: 0; }
+  /* ---- app detail: layout ---- */
+  .layout { max-width: var(--maxw); margin: 0 auto; display: flex; gap: 24px; align-items: flex-start; padding: 22px 24px 64px; }
+  .nav { width: 232px; flex-shrink: 0; position: sticky; top: 76px; background: var(--surface); border: 1px solid var(--border);
+         border-radius: var(--r); padding: 8px; display: flex; flex-direction: column; gap: 2px; }
+  .nav-group { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); padding: 12px 12px 4px; font-weight: 650; }
+  .nav-item { display: flex; align-items: center; gap: 11px; padding: 9px 12px; border-radius: 9px; cursor: pointer;
+              font-size: 13.5px; font-weight: 550; color: var(--muted); transition: background .12s, color .12s; }
+  .nav-item:hover { background: var(--surface-2); color: var(--text); }
+  .nav-item.active { background: var(--info-bg); color: var(--accent); font-weight: 650; }
+  .nav-item svg { width: 17px; height: 17px; fill: currentColor; flex-shrink: 0; opacity: .9; }
+  .content { flex: 1; min-width: 0; }
   .panel { display: none; }
   .panel.active { display: block; }
-  h2.blade-h { font-size: 16px; font-weight: 600; margin-bottom: 12px; }
-  .desc { color: var(--muted); margin-bottom: 16px; max-width: 780px; }
-  .card { background: #fff; border: 1px solid var(--border2); border-radius: 2px; padding: 16px; margin-bottom: 16px; }
-  .essentials { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 4px 48px; }
-  .kv { display: flex; padding: 3px 0; font-size: 13px; }
-  .kv .k { color: var(--muted); width: 150px; flex-shrink: 0; }
-  .info-bar { background: #eff6fc; border-left: 3px solid var(--blue); padding: 10px 14px; margin-bottom: 16px; }
 
-  .console { background: #1e1e1e; color: #d4d4d4; font-family: Consolas, monospace; font-size: 12px; padding: 14px; border-radius: 2px; line-height: 1.6; height: 62vh; overflow: auto; white-space: pre-wrap; }
-  .console div { min-height: 1.2em; }
+  h2.blade-h { font-size: 19px; font-weight: 700; letter-spacing: -.01em; margin-bottom: 6px; }
+  .desc { color: var(--muted); margin-bottom: 18px; max-width: 760px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); padding: 20px; margin-bottom: 18px; box-shadow: var(--shadow-sm); }
+  .essentials { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 0 44px; }
+  .kv { display: flex; gap: 14px; padding: 9px 0; font-size: 13.5px; border-bottom: 1px solid var(--border); }
+  .kv .k { color: var(--muted); width: 130px; flex-shrink: 0; }
+  .kv .v { min-width: 0; overflow-wrap: anywhere; }
+  .info-bar { display: flex; gap: 10px; background: var(--info-bg); border: 1px solid rgba(96,165,250,.25);
+              border-radius: var(--r-sm); padding: 12px 14px; margin-bottom: 18px; font-size: 13px; }
+  .info-bar b { color: var(--text); }
 
-  /* create modal */
-  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; align-items: flex-start; justify-content: center; z-index: 50; }
-  .modal { background: #fff; margin-top: 72px; width: 480px; max-width: 92vw; border-radius: 4px; box-shadow: 0 8px 30px rgba(0,0,0,.3); overflow: hidden; }
-  .modal-h { padding: 14px 20px; font-size: 16px; font-weight: 600; background: var(--masthead); color: #fff; }
-  .modal-b { padding: 20px; }
-  .modal-f { padding: 14px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; }
-  .field { margin-bottom: 16px; }
-  .field label { display: block; font-weight: 600; margin-bottom: 4px; }
-  .field input { width: 100%; height: 32px; border: 1px solid var(--border2); border-radius: 2px; padding: 0 10px; font-family: inherit; font-size: 13px; }
-  .field .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .err { color: #a4262c; font-size: 12px; min-height: 16px; }
+  /* ---- tables (config / domains) ---- */
+  .tbl-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--r); background: var(--surface); }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th { text-align: left; font-weight: 600; color: var(--muted); padding: 12px 16px; background: var(--surface-2);
+       border-bottom: 1px solid var(--border); font-size: 11.5px; letter-spacing: .03em; text-transform: uppercase; }
+  td { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover td { background: var(--surface-2); }
 
-  .source-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
-  .source { border: 1px solid var(--border2); border-radius: 2px; padding: 14px; text-align: center; background: #fff; }
-  .source.sel { border-color: var(--blue); border-width: 2px; background: #f3f9fd; }
-  .source .s-ico { font-size: 24px; margin-bottom: 6px; }
+  /* ---- console ---- */
+  .console { background: #0b0f17; color: #cdd6e4; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px;
+             line-height: 1.7; padding: 16px 18px; border-radius: var(--r); border: 1px solid var(--border);
+             height: 60vh; overflow: auto; white-space: pre-wrap; }
+  .console div { min-height: 1.25em; }
+
+  /* ---- deployment sources ---- */
+  .source-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .source { border: 1px solid var(--border-2); border-radius: var(--r-sm); padding: 16px; text-align: center; background: var(--surface);
+            cursor: pointer; transition: background .15s, border-color .15s; }
+  .source:hover { background: var(--surface-2); }
+  .source.sel { border-color: var(--accent); background: var(--info-bg); box-shadow: var(--ring); }
+  .source .s-ico { font-size: 26px; margin-bottom: 8px; }
+
+  /* ---- create modal ---- */
+  .overlay { position: fixed; inset: 0; background: rgba(3,6,12,.62); display: none; align-items: flex-start; justify-content: center;
+             z-index: 60; padding: 20px; }
+  .modal { background: var(--surface); margin-top: 8vh; width: 500px; max-width: 100%; border-radius: 16px; border: 1px solid var(--border-2);
+           box-shadow: var(--shadow); overflow: hidden; animation: pop .18s ease; }
+  @keyframes pop { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: none; } }
+  .modal-h { padding: 18px 22px; font-size: 17px; font-weight: 700; border-bottom: 1px solid var(--border); }
+  .modal-b { padding: 22px; }
+  .modal-f { padding: 16px 22px; border-top: 1px solid var(--border); display: flex; gap: 10px; justify-content: flex-end; background: var(--surface-2); }
+  .field { margin-bottom: 18px; }
+  .field label { display: block; font-weight: 600; margin-bottom: 7px; font-size: 13.5px; }
+  .field input { width: 100%; height: 42px; border: 1px solid var(--border-2); border-radius: var(--r-sm); padding: 0 13px;
+                 font-family: inherit; font-size: 14px; background: var(--surface-2); color: var(--text);
+                 transition: border-color .15s, box-shadow .15s, background .15s; }
+  .field input::placeholder { color: var(--faint); }
+  .field input:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); background: var(--surface); }
+  .field .hint { font-size: 12.5px; color: var(--muted); margin-top: 7px; }
+  .err { color: var(--bad); font-size: 13px; min-height: 18px; font-weight: 550; }
+
+  /* ---- responsive ---- */
+  @media (max-width: 820px) {
+    .layout { flex-direction: column; padding: 16px; gap: 16px; }
+    .nav { width: 100%; position: static; flex-direction: row; overflow-x: auto; gap: 4px; }
+    .nav-group { display: none; }
+    .nav-item { white-space: nowrap; }
+    .page { padding: 20px 16px 48px; }
+    .res-header { padding: 16px 16px 0; }
+  }
+  @media (max-width: 560px) {
+    .apps-grid { grid-template-columns: 1fr; }
+    .list-head h1 { font-size: 22px; }
+    .topbar { padding: 0 14px; }
+    .console { height: 52vh; }
+  }
 </style>
 </head>
 <body>
 
-<div class="masthead">
+<header class="topbar">
   <div class="logo" onclick="showList()">
-    <svg width="22" height="22" viewBox="0 0 24 24"><defs><linearGradient id="jg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#50e6ff"/><stop offset="1" stop-color="#0078d4"/></linearGradient></defs><rect x="2" y="2" width="20" height="20" rx="4" fill="url(#jg)"/><text x="12" y="17" font-size="13" font-weight="700" text-anchor="middle" fill="#fff" font-family="Segoe UI, sans-serif">J</text></svg>
+    <div class="mark">J</div>
     Jerrick Cloud
   </div>
-  <div class="search">🔍&nbsp; Search resources, services, and docs</div>
   <div class="spacer"></div>
-  <div class="icons">
-    <span title="Cloud Shell">&gt;_</span><span title="Notifications">🔔</span><span title="Settings">⚙️</span><span title="Help">❓</span>
-    <div class="avatar" id="me" title="jerrickjamesdecena@gmail.com">JD</div>
-  </div>
-</div>
+  <div class="avatar" id="me" title="jerrickjamesdecena@gmail.com">JD</div>
+</header>
 
 <!-- ===================== LIST SCREEN ===================== -->
 <div id="screen-list">
-  <div class="breadcrumb"><a onclick="showList()">Home</a> <span>&gt;</span> <span class="cur">App Services</span></div>
+  <div class="breadcrumb"><a onclick="showList()">Home</a> <span class="sep">/</span> <span class="cur">App Services</span></div>
   <div class="page">
     <div class="list-head">
       <div>
         <h1>App Services</h1>
         <div class="sub">Web apps deployed to Jerrick Cloud</div>
       </div>
-      <button class="btn primary" onclick="openCreate()">＋ Create web app</button>
+      <button class="btn primary" onclick="openCreate()">＋ New web app</button>
     </div>
 
     <div id="empty" class="empty" style="display:none">
+      <div class="e-ico">🚀</div>
       <h3>No web apps yet</h3>
-      <div>Deploy a Node web app from a Git repo or a local folder to get started.</div>
-      <div style="margin-top:14px"><button class="btn primary" onclick="openCreate()">＋ Create your first web app</button></div>
+      <div>Deploy a Node, Python, or .NET app from a Git repo or a local folder to get started.</div>
+      <button class="btn primary" onclick="openCreate()">＋ Create your first app</button>
     </div>
 
-    <table id="apps-table" style="display:none">
-      <thead><tr><th>Name</th><th>Status</th><th>URL</th><th>Source</th><th>Created</th></tr></thead>
-      <tbody id="apps-tbody"></tbody>
-    </table>
+    <div id="apps-grid" class="apps-grid"></div>
   </div>
 </div>
 
 <!-- ===================== APP DETAIL SCREEN ===================== -->
 <div id="screen-app" style="display:none">
-  <div class="breadcrumb"><a onclick="showList()">Home</a> <span>&gt;</span> <a onclick="showList()">App Services</a> <span>&gt;</span> <span class="cur" id="app-crumb"></span></div>
+  <div class="breadcrumb"><a onclick="showList()">Home</a> <span class="sep">/</span> <a onclick="showList()">App Services</a> <span class="sep">/</span> <span class="cur" id="app-crumb"></span></div>
 
   <div class="res-header">
-    <div class="res-title">
-      <div class="ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="#fff"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5zm0 2.3 6.5 3.6L12 11.5 5.5 7.9 12 4.3zM5 9.6l6 3.3v6.8l-6-3.3V9.6zm14 0v6.8l-6 3.3v-6.8l6-3.3z"/></svg></div>
-      <div><h1 id="app-name"></h1><div class="sub">Web App · Jerrick Cloud</div></div>
+    <div class="res-wrap">
+      <div class="res-title">
+        <div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="#fff"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5zm0 2.3 6.5 3.6L12 11.5 5.5 7.9 12 4.3zM5 9.6l6 3.3v6.8l-6-3.3V9.6zm14 0v6.8l-6 3.3v-6.8l6-3.3z"/></svg></div>
+        <div><h1 id="app-name"></h1><div class="sub">Web App · Jerrick Cloud</div></div>
+      </div>
+      <div class="toolbar" id="app-toolbar"></div>
     </div>
-    <div class="toolbar" id="app-toolbar"></div>
   </div>
 
   <div class="layout">
     <nav class="nav">
       <div class="nav-group">Overview</div>
-      <div class="nav-item active" data-panel="overview"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M3 3h8v8H3zm10 0h8v5h-8zm0 7h8v11h-8zM3 13h8v8H3z"/></svg>Overview</div>
+      <div class="nav-item active" data-panel="overview"><svg viewBox="0 0 24 24"><path d="M3 3h8v8H3zm10 0h8v5h-8zm0 7h8v11h-8zM3 13h8v8H3z"/></svg>Overview</div>
       <div class="nav-group">Deployment</div>
-      <div class="nav-item" data-panel="deployment"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M12 2 4 6v6c0 5 3.4 9.7 8 10 4.6-.3 8-5 8-10V6l-8-4z"/></svg>Deployment Center</div>
+      <div class="nav-item" data-panel="deployment"><svg viewBox="0 0 24 24"><path d="M12 2 4 6v6c0 5 3.4 9.7 8 10 4.6-.3 8-5 8-10V6l-8-4z"/></svg>Deployment Center</div>
       <div class="nav-group">Settings</div>
-      <div class="nav-item" data-panel="config"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm9 4-2 3 1 3-3 1-2 3h-4l-2-3-3-1 1-3-2-3 2-3-1-3 3-1 2-3h4l2 3 3 1-1 3z"/></svg>Configuration</div>
-      <div class="nav-item" data-panel="scale"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M4 20V10h4v10zm6 0V4h4v16zm6 0v-7h4v7z"/></svg>Scale up (plan)</div>
-      <div class="nav-item" data-panel="domains"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2c1.7 0 3.9 3.2 4 8H8c.1-4.8 2.3-8 4-8zm0 16c-1.7 0-3.9-3.2-4-8h8c-.1 4.8-2.3 8-4 8z"/></svg>Custom domains</div>
+      <div class="nav-item" data-panel="config"><svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm9 4-2 3 1 3-3 1-2 3h-4l-2-3-3-1 1-3-2-3 2-3-1-3 3-1 2-3h4l2 3 3 1-1 3z"/></svg>Configuration</div>
+      <div class="nav-item" data-panel="scale"><svg viewBox="0 0 24 24"><path d="M4 20V10h4v10zm6 0V4h4v16zm6 0v-7h4v7z"/></svg>Scale up (plan)</div>
+      <div class="nav-item" data-panel="domains"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2c1.7 0 3.9 3.2 4 8H8c.1-4.8 2.3-8 4-8zm0 16c-1.7 0-3.9-3.2-4-8h8c-.1 4.8-2.3 8-4 8z"/></svg>Custom domains</div>
       <div class="nav-group">Monitoring</div>
-      <div class="nav-item" data-panel="logstream"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M4 5h16v3H4zm0 5h16v3H4zm0 5h10v3H4z"/></svg>Log stream</div>
+      <div class="nav-item" data-panel="logstream"><svg viewBox="0 0 24 24"><path d="M4 5h16v3H4zm0 5h16v3H4zm0 5h10v3H4z"/></svg>Log stream</div>
     </nav>
 
     <main class="content">
@@ -185,11 +288,11 @@
             <div class="kv"><span class="k">Source type</span><span class="v" id="ov-type"></span></div>
             <div class="kv"><span class="k">Port</span><span class="v mono" id="ov-port"></span></div>
             <div class="kv"><span class="k">Created</span><span class="v" id="ov-created"></span></div>
-            <div class="kv"><span class="k">Runtime stack</span><span class="v">Node (npm start)</span></div>
+            <div class="kv"><span class="k">Runtime stack</span><span class="v" id="ov-runtime">Auto-detected</span></div>
             <div class="kv"><span class="k">Region</span><span class="v">Local · Jerrick Cloud</span></div>
           </div>
         </div>
-        <div class="info-bar">Jerrick Cloud runs <b class="mono">npm install</b> then <b class="mono">npm start</b> with <b class="mono">PORT</b> injected. Your app must listen on <b class="mono">process.env.PORT</b>. Watch it happen live under <a onclick="selectPanel('logstream')">Log stream</a>.</div>
+        <div class="info-bar">Jerrick Cloud installs dependencies then starts your app with <b class="mono">PORT</b> injected. Your app must listen on <b class="mono">process.env.PORT</b>. Watch it happen live under <a onclick="selectPanel('logstream')">Log stream</a>.</div>
       </section>
 
       <!-- Deployment Center -->
@@ -203,9 +306,9 @@
         </div>
         <div class="card" style="max-width:640px">
           <div class="kv"><span class="k">Source</span><span class="v mono" id="dep-source"></span></div>
-          <div class="kv"><span class="k">Build command</span><span class="v mono">npm install</span></div>
-          <div class="kv"><span class="k">Start command</span><span class="v mono">npm start</span></div>
-          <div style="margin-top:14px; display:flex; gap:8px">
+          <div class="kv"><span class="k">Build command</span><span class="v mono">auto (npm / pip / dotnet)</span></div>
+          <div class="kv"><span class="k">Start command</span><span class="v mono">auto or Procfile web:</span></div>
+          <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap">
             <button class="btn primary" onclick="act('redeploy'); selectPanel('logstream')">⬆ Redeploy</button>
             <button class="btn" onclick="selectPanel('logstream')">View build logs</button>
           </div>
@@ -216,13 +319,15 @@
       <section class="panel" id="p-config">
         <h2 class="blade-h">Configuration</h2>
         <p class="desc">Environment variables passed to your app at runtime. <span class="muted">(Editing coming soon — PORT is injected automatically.)</span></p>
-        <table>
-          <thead><tr><th>Name</th><th>Value</th></tr></thead>
-          <tbody>
-            <tr><td class="mono">PORT</td><td class="mono">&lt;assigned by Jerrick Cloud&gt;</td></tr>
-            <tr><td class="mono">NODE_ENV</td><td class="mono">production</td></tr>
-          </tbody>
-        </table>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">PORT</td><td class="mono">&lt;assigned by Jerrick Cloud&gt;</td></tr>
+              <tr><td class="mono">NODE_ENV</td><td class="mono">production</td></tr>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <!-- Scale (static) -->
@@ -236,7 +341,9 @@
       <section class="panel" id="p-domains">
         <h2 class="blade-h">Custom domains</h2>
         <p class="desc">Jerrick Cloud's built-in reverse proxy gives every running app a subdomain. Bring-your-own custom domains are the next milestone.</p>
-        <table><thead><tr><th>Domain</th><th>Status</th></tr></thead><tbody id="dom-tbody"></tbody></table>
+        <div class="tbl-wrap">
+          <table><thead><tr><th>Domain</th><th>Status</th></tr></thead><tbody id="dom-tbody"></tbody></table>
+        </div>
       </section>
 
       <!-- Log stream (live) -->
@@ -262,12 +369,12 @@
       <div class="field">
         <label>Source</label>
         <input id="c-source" placeholder="https://github.com/you/repo  —or—  C:\path\to\app" autocomplete="off" required>
-        <div class="hint">A Git URL (cloned) or a local folder path (run in place). Must be a Node app with an <span class="mono">npm start</span> script.</div>
+        <div class="hint">A Git URL (cloned) or a local folder path (run in place). Node, Python, .NET, or any repo with a <span class="mono">Procfile</span>.</div>
       </div>
       <div class="field">
         <label>Access token <span class="muted" style="font-weight:400">— optional, for private GitHub repos</span></label>
         <input id="c-token" type="password" placeholder="ghp_… or github_pat_…" autocomplete="off">
-        <div class="hint">A GitHub <a href="https://github.com/settings/tokens" target="_blank">personal access token</a> with <span class="mono">repo</span> (or Contents: read) access. Used only to clone — Jerrick never stores it.</div>
+        <div class="hint">A GitHub <a href="https://github.com/settings/tokens" target="_blank" rel="noopener">personal access token</a> with <span class="mono">repo</span> (or Contents: read) access. Used only to clone — Jerrick never stores it.</div>
       </div>
       <div class="err" id="c-error"></div>
     </div>
@@ -283,8 +390,10 @@
   let es = null;          // SSE connection
   let currentName = null; // open app
 
-  const badge = s => `<span class="status-badge s-${s}">${s}</span>`;
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const badge = s => `<span class="status-badge s-${s}">${esc(s)}</span>`;
   const api = (p, opts) => fetch('/api/apps' + p, opts).then(r => r.json());
+  const CUBE = '<svg viewBox="0 0 24 24" fill="#fff"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5zm0 2.3 6.5 3.6L12 11.5 5.5 7.9 12 4.3zM5 9.6l6 3.3v6.8l-6-3.3V9.6zm14 0v6.8l-6 3.3v-6.8l6-3.3z"/></svg>';
 
   // ---------- auth (avatar shows the signed-in Google user; click to sign out) ----------
   fetch('/api/me').then(r => r.json()).then(m => {
@@ -303,21 +412,23 @@
     $('#screen-app').style.display = 'none';
     $('#screen-list').style.display = 'block';
     const apps = await api('');
-    const tb = $('#apps-tbody'); tb.innerHTML = '';
+    const grid = $('#apps-grid');
     $('#empty').style.display = apps.length ? 'none' : 'block';
-    $('#apps-table').style.display = apps.length ? 'table' : 'none';
-    for (const a of apps) {
-      const tr = document.createElement('tr');
-      tr.style.cursor = 'pointer';
-      tr.innerHTML =
-        `<td><a>${a.name}</a></td>` +
-        `<td>${badge(a.status)}</td>` +
-        `<td>${a.url ? `<a href="${a.url}" target="_blank" onclick="event.stopPropagation()">${a.url}</a>` : '<span class="muted">—</span>'}</td>` +
-        `<td class="mono">${a.source}</td>` +
-        `<td>${a.createdAt ? new Date(a.createdAt).toLocaleString() : ''}</td>`;
-      tr.onclick = () => showApp(a.name);
-      tb.appendChild(tr);
-    }
+    grid.innerHTML = apps.map(a => {
+      const created = a.createdAt ? new Date(a.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : '';
+      const open = a.url && a.status === 'running'
+        ? `<a href="${esc(a.url)}" target="_blank" onclick="event.stopPropagation()">Open ↗</a>`
+        : '<span class="muted">Not running</span>';
+      return `<div class="app-card" onclick="showApp('${esc(a.name)}')">
+        <div class="app-card-top">
+          <div class="app-ico">${CUBE}</div>
+          <div class="app-card-name ellipsis">${esc(a.name)}</div>
+          ${badge(a.status)}
+        </div>
+        <div class="app-card-meta ellipsis mono" title="${esc(a.source)}">${esc(a.source)}</div>
+        <div class="app-card-foot">${open}<span class="muted">${esc(created)}</span></div>
+      </div>`;
+    }).join('');
   }
 
   // ---------- app detail ----------
@@ -336,16 +447,17 @@
     $('#app-crumb').textContent = a.name;
     $('#ov-status').innerHTML = badge(a.status);
     $('#ov-url').innerHTML = a.url && a.status === 'running'
-      ? `<a href="${a.url}" target="_blank">${a.url}</a>`
+      ? `<a href="${esc(a.url)}" target="_blank">${esc(a.url)}</a>`
       : '<span class="muted">— (app not running)</span>';
     $('#ov-source').textContent = a.source;
     $('#ov-type').textContent = a.managed ? 'Git repository (cloned)' : 'Local folder (in place)';
     $('#ov-port').textContent = a.port || '—';
     $('#ov-created').textContent = a.createdAt ? new Date(a.createdAt).toLocaleString() : '';
+    $('#ov-runtime').textContent = a.runtime || 'Auto-detected';
     $('#dep-source').textContent = a.source;
     $('#dom-tbody').innerHTML = a.url && a.status === 'running'
-      ? `<tr><td class="mono">${a.url.replace('http://', '')}</td><td>${badge(a.status)}</td></tr>` +
-        `<tr><td class="mono">localhost:${a.port} <span class="muted">(direct)</span></td><td>${badge(a.status)}</td></tr>`
+      ? `<tr><td class="mono">${esc(a.url.replace('http://', ''))}</td><td>${badge(a.status)}</td></tr>` +
+        `<tr><td class="mono">localhost:${esc(a.port)} <span class="muted">(direct)</span></td><td>${badge(a.status)}</td></tr>`
       : `<tr><td colspan="2" class="muted">App not running.</td></tr>`;
     renderToolbar(a);
   }
@@ -356,12 +468,12 @@
     const tb = (action, label, disabled) =>
       `<button class="tb-btn" ${disabled ? 'disabled' : ''} onclick="act('${action}')">${label}</button>`;
     let html = running
-      ? `<a class="tb-btn" href="${a.url}" target="_blank">▶ Browse</a>`
+      ? `<a class="tb-btn" href="${esc(a.url)}" target="_blank">▶ Browse</a>`
       : `<button class="tb-btn" disabled>▶ Browse</button>`;
     html += running ? tb('stop', '⏹ Stop') : tb('start', '▶ Start', busy);
     html += tb('restart', '🔁 Restart', busy);
     html += tb('redeploy', '⬆ Redeploy', busy);
-    html += `<button class="tb-btn danger" onclick="delApp('${a.name}')">🗑 Delete</button>`;
+    html += `<button class="tb-btn danger" onclick="delApp('${esc(a.name)}')">🗑 Delete</button>`;
     $('#app-toolbar').innerHTML = html;
   }
 
