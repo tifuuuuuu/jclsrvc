@@ -384,20 +384,45 @@ function checkAlert(resource, pct) {
     `Host ${resource} usage is ${pct}% (alert threshold ${ALERT_PCT}%).\nFree up ${resource} on your Jerrick Cloud server.`, null);
 }
 
-// Resident memory of a child pid, via the OS (Node doesn't expose child RSS). Resolves bytes or null.
-// ponytail: per-pid only, no child-tree sum, no CPU% — a spawn per query. Enough for a home-server gauge.
-function pidRss(pid) {
+// "[D-]H:MM:SS" (win tasklist) / "[DD-]HH:MM:SS" (unix ps) cumulative CPU time -> ms, or null.
+function parseCpuTime(s) {
+  const m = String(s).trim().match(/^(?:(\d+)-)?(\d+):(\d+)(?::(\d+))?/); // optional days, then A:B[:C]
+  if (!m) return null;
+  const d = +m[1] || 0, g = [m[2], m[3], m[4]].filter(x => x != null).map(Number);
+  const [h, mi, se] = g.length === 3 ? g : [0, g[0], g[1]]; // 3 parts = H:M:S, 2 = M:S
+  return (((d * 24 + h) * 60 + mi) * 60 + se) * 1000;
+}
+// Per-pid resident memory + cumulative CPU time in one OS query (Node exposes neither for children).
+// ponytail: per-pid only (no child-tree sum); CPU time has 1s resolution -> % is coarse for near-idle apps.
+//   Enough for a home-server gauge; poll tighter or read perf counters if you need precision.
+function pidStat(pid) {
   return new Promise(resolve => {
-    if (!pid) return resolve(null);
+    if (!pid) return resolve({ rss: null, cpuMs: null });
     const [cmd, args, parse] = IS_WIN
-      ? ['tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], o => { const m = o.match(/"([\d.,]+) K"\s*$/m); return m ? parseInt(m[1].replace(/[.,]/g, ''), 10) * 1024 : null; }]
-      : ['ps', ['-o', 'rss=', '-p', String(pid)], o => { const n = parseInt(o.trim(), 10); return isNaN(n) ? null : n * 1024; }];
+      ? ['tasklist', ['/v', '/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], o => {
+          const f = (o.match(/"([^"]*)"/g) || []).map(s => s.slice(1, -1)); // /v CSV: mem @4 ("12,345 K"), CPU time @7
+          return { rss: f[4] ? parseInt(f[4].replace(/\D/g, ''), 10) * 1024 : null, cpuMs: parseCpuTime(f[7]) };
+        }]
+      : ['ps', ['-o', 'rss=,cputime=', '-p', String(pid)], o => {
+          const [r, t] = o.trim().split(/\s+/); const rss = parseInt(r, 10);
+          return { rss: isNaN(rss) ? null : rss * 1024, cpuMs: parseCpuTime(t) };
+        }];
     let out = '';
     const p = spawn(cmd, args);
     p.stdout.on('data', d => out += d);
-    p.on('error', () => resolve(null));
-    p.on('close', () => { try { resolve(parse(out)); } catch (_) { resolve(null); } });
+    p.on('error', () => resolve({ rss: null, cpuMs: null }));
+    p.on('close', () => { try { resolve(parse(out)); } catch (_) { resolve({ rss: null, cpuMs: null }); } });
   });
+}
+// Instantaneous CPU% from the growth in cumulative CPU time between two polls, normalised by core count.
+// Keyed by app name and reset when the pid changes (restart), so the map stays bounded by app count.
+const cpuHist = new Map(); // name -> { pid, cpuMs, ts }
+function pidCpuPct(name, pid, cpuMs) {
+  if (cpuMs == null || !pid) { cpuHist.delete(name); return null; }
+  const now = Date.now(), prev = cpuHist.get(name);
+  cpuHist.set(name, { pid, cpuMs, ts: now });
+  if (!prev || prev.pid !== pid || now <= prev.ts) return null; // need two samples of the same process
+  return Math.max(0, Math.min(100, Math.round((cpuMs - prev.cpuMs) / (now - prev.ts) / os.cpus().length * 100)));
 }
 
 // Current HEAD (short sha) of a git working copy, or null. Used for deploy history / rollback.
@@ -612,8 +637,7 @@ async function recordUser(user) {
 
 // ---- host metrics (memory + disk) ----
 // Host-level only: total/used memory (os) and disk usage of the drive holding Jerrick Cloud (fs.statfs).
-// ponytail: per-app memory would need OS-specific process queries (tasklist/ps) — host gauges cover the
-//   "is my home server running out of RAM/disk" question; add per-pid sampling if you ever need it.
+// ponytail: host-level only — per-app memory/CPU live in pidStat, queried per app on demand, not sampled here.
 function metrics() {
   const total = os.totalmem(), free = os.freemem(), used = total - free;
   const mem = { total, free, used, pct: Math.round(used / total * 100) };
@@ -757,9 +781,10 @@ const handler = async (req, res) => {
     if (req.method === 'GET' && parts.length === 3) return json(res, app);
 
     if (req.method === 'GET' && parts[3] === 'stats' && parts.length === 4) {
-      const rss = await pidRss(app.pid);
+      const st = await pidStat(app.pid);
+      const cpu = pidCpuPct(app.name, app.pid, st.cpuMs);
       const uptimeSec = app.startedAt && app.status === 'running' ? Math.round((Date.now() - new Date(app.startedAt)) / 1000) : 0;
-      return json(res, { status: app.status, health: app.health || 'unknown', rss, uptimeSec, restarts: app.restarts || 0 });
+      return json(res, { status: app.status, health: app.health || 'unknown', rss: st.rss, cpu, uptimeSec, restarts: app.restarts || 0 });
     }
 
     if (req.method === 'PUT' && parts[3] === 'env' && parts.length === 4) {
@@ -889,6 +914,11 @@ if (process.argv.includes('--check')) {
   // tasklist memory parse: "12,345 K" -> bytes (thousands separators stripped).
   const winMem = '"node.exe","1234","Console","1","12,345 K"'.match(/"([\d.,]+) K"\s*$/m);
   assert.equal(parseInt(winMem[1].replace(/[.,]/g, ''), 10) * 1024, 12345 * 1024);
+  // CPU-time parse: "H:MM:SS" / "[D-]H:MM:SS" / "MM:SS" -> ms; junk -> null.
+  assert.equal(parseCpuTime('0:00:12'), 12_000);
+  assert.equal(parseCpuTime('1-02:03:04'), 93_784_000);
+  assert.equal(parseCpuTime('05:30'), 330_000);
+  assert.equal(parseCpuTime('N/A'), null);
   // Custom-domain validation: accept an FQDN, reject a bare word.
   assert.ok(/^[a-z0-9.-]+\.[a-z0-9.-]+$/.test('app.example.com'));
   assert.ok(!/^[a-z0-9.-]+\.[a-z0-9.-]+$/.test('localhost'));

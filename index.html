@@ -342,7 +342,7 @@
         <div class="source-grid">
           <div class="source sel"><div class="s-ico">🐙</div><div>Git</div></div>
           <div class="source"><div class="s-ico">📁</div><div>Local folder</div></div>
-          <div class="source" style="opacity:.4"><div class="s-ico">📤</div><div>Zip upload</div></div>
+          <div class="source"><div class="s-ico">📤</div><div>Zip upload</div></div>
         </div>
         <div class="card" style="max-width:640px">
           <div class="kv"><span class="k">Source</span><span class="v mono" id="dep-source"></span></div>
@@ -416,6 +416,7 @@
         <div class="card" style="padding:14px 18px; margin-bottom:16px">
           <div class="essentials">
             <div class="kv"><span class="k">Process memory</span><span class="v mono" id="st-rss">—</span></div>
+            <div class="kv"><span class="k">Process CPU</span><span class="v mono" id="st-cpu">—</span></div>
             <div class="kv"><span class="k">Uptime</span><span class="v" id="st-uptime">—</span></div>
             <div class="kv"><span class="k">Restarts</span><span class="v" id="st-restarts">—</span></div>
             <div class="kv"><span class="k">Health</span><span class="v" id="st-health"><span class="health-unknown">—</span></span></div>
@@ -581,9 +582,10 @@
     if (s.error) return;
     const up = s.uptimeSec ? fmtDuration(s.uptimeSec) : '—';
     const rss = s.rss ? fmtBytes(s.rss) : '—';
+    const cpu = s.cpu != null ? s.cpu + '%' : '—';
     const health = healthHtml(s.health, s.status);
     $('#ov-health').innerHTML = health; $('#ov-uptime').textContent = up;
-    $('#st-rss').textContent = rss; $('#st-uptime').textContent = up;
+    $('#st-rss').textContent = rss; $('#st-cpu').textContent = cpu; $('#st-uptime').textContent = up;
     $('#st-restarts').textContent = s.restarts || 0; $('#st-health').innerHTML = health;
   }
 
