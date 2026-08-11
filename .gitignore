@@ -10,6 +10,9 @@ apps.json
 # git clones of deployed apps
 workspaces/
 
+# persisted per-app logs (runtime)
+logs/
+
 # editor / IDE
 .vs/
 

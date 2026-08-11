@@ -5,6 +5,7 @@
 // ponytail: no sandboxing / multi-tenant isolation — that's the "big cloud" version.
 
 const http = require('http');
+const os = require('os');
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
@@ -20,6 +21,18 @@ const PORT = process.env.PORT || 8080;
 const PORT_BASE = 3001;
 const LOG_CAP = 500; // ponytail: keep last 500 log lines/app in memory; add a real log store if it matters
 const IS_WIN = process.platform === 'win32';
+const LOG_DIR = path.join(ROOT, 'logs');       // persisted per-app logs (survive restarts, downloadable)
+const LOG_FILE_CAP = 2 * 1024 * 1024;          // trim on-disk log to last ~1MB once it passes 2MB
+const RESTART_MAX = 5;                          // crash-loop guard: give up after this many restarts...
+const RESTART_WINDOW = 60_000;                  // ...within this window
+const HEALTH_INTERVAL = 20_000;                 // TCP health probe cadence
+const METRIC_INTERVAL = 15_000;                 // host metric sampling cadence
+const METRIC_HISTORY = 240;                     // ~1h of samples at 15s
+const ALERT_PCT = Number(process.env.ALERT_PCT || 85);   // email when mem/disk crosses this %
+const ALERT_EVERY = 30 * 60_000;                // re-alert at most this often, per resource
+const SSL = (process.env.SSL_CERT && process.env.SSL_KEY)   // optional HTTPS — point these at a cert/key pair
+  ? { cert: fs.readFileSync(process.env.SSL_CERT), key: fs.readFileSync(process.env.SSL_KEY) } : null;
+const PROTO = SSL ? 'https' : 'http';
 
 // Parse one .env line -> [key, value] or null (blank/comment/invalid). Strips surrounding quotes.
 const parseEnvLine = line => {
@@ -73,6 +86,21 @@ try { apps = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (_) {}
 const procs = new Map();    // name -> child process
 const logbuf = new Map();   // name -> string[]
 const clients = new Map();  // name -> Set<res> (SSE)
+const restartHist = new Map();       // name -> number[] recent auto-restart timestamps (crash-loop guard)
+const healthFails = new Map();       // name -> consecutive failed health probes
+const lastHealthRestart = new Map(); // name -> ts of last health-triggered restart (throttle)
+const metricHistory = [];            // ring buffer of { ts, mem, disk } host samples
+const lastAlert = {};                // resource -> ts of last threshold email (throttle)
+
+const logFile = name => path.join(LOG_DIR, slugify(name) + '.log');
+// Mirror a log chunk to disk so logs survive restarts and can be downloaded. Self-trims when it grows past the cap.
+function appendLogFile(name, text) {
+  try {
+    const f = logFile(name);
+    fs.appendFileSync(f, text.endsWith('\n') ? text : text + '\n');
+    if (fs.statSync(f).size > LOG_FILE_CAP) fs.writeFileSync(f, fs.readFileSync(f).slice(-LOG_FILE_CAP / 2));
+  } catch (_) {}
+}
 
 const find = name => apps.find(a => a.name === name);
 const save = () => fs.writeFileSync(STATE_FILE, JSON.stringify(apps, null, 2));
@@ -90,6 +118,7 @@ function pushLog(name, chunk) {
     buf.push(line);
     if (buf.length > LOG_CAP) buf.shift();
     broadcast(name, 'message', line);
+    appendLogFile(name, line);
   }
   logbuf.set(name, buf);
 }
@@ -202,13 +231,17 @@ function detectRuntime(cwd) {
   return rt;
 }
 
-async function deploy(app, token) {
+async function deploy(app, token, checkout) {
   logbuf.set(app.name, []); // fresh build log
   setStatus(app.name, 'building');
   pushLog(app.name, `=== Deploying ${app.name} ===`);
 
   let cwd;
-  if (app.managed) {
+  if (app.uploaded) {
+    // Zip-uploaded app: code already lives in workspaces/<name>; nothing to clone.
+    cwd = path.join(WORKSPACES, app.name);
+    if (!fs.existsSync(cwd)) { pushLog(app.name, `Upload missing for ${app.name}`); return setStatus(app.name, 'failed'); }
+  } else if (app.managed) {
     cwd = path.join(WORKSPACES, app.name);
     if (!fs.existsSync(cwd)) {
       fs.mkdirSync(WORKSPACES, { recursive: true });
@@ -219,6 +252,13 @@ async function deploy(app, token) {
       pushLog(app.name, `$ git pull`); // token persisted in the clone's .git/config from the first clone
       await run(app.name, 'git', ['pull'], cwd, false, gitEnv());
     }
+    if (checkout) { // rollback: pin to a past commit
+      pushLog(app.name, `$ git checkout ${checkout}`);
+      if (!await run(app.name, 'git', ['checkout', checkout], cwd, false, gitEnv()))
+        return setStatus(app.name, 'failed');
+    }
+    const commit = await gitHead(cwd); // record what we deployed (for history + rollback)
+    if (commit) { pushLog(app.name, `Deployed commit ${commit}`); recordDeploy(app, commit); }
   } else {
     cwd = app.source;
     if (!fs.existsSync(cwd)) { pushLog(app.name, `Path not found: ${cwd}`); return setStatus(app.name, 'failed'); }
@@ -245,6 +285,7 @@ async function deploy(app, token) {
 }
 
 async function startApp(app) {
+  app.desired = 'running'; // starting expresses intent to run → drives auto-restart + boot auto-start
   const rt = detectRuntime(app.cwd);
   if (!rt) { pushLog(app.name, `No runtime detected in ${app.cwd} — redeploy needed.`); return setStatus(app.name, 'failed'); }
   const used = new Set(apps.map(a => a.port).filter(p => p && p !== app.port));
@@ -252,28 +293,137 @@ async function startApp(app) {
   pushLog(app.name, `$ PORT=${port} ${rt.start}`);
   const child = spawn(rt.start, {
     cwd: app.cwd, shell: true,
-    // PORT is the cross-runtime convention; ASPNETCORE_URLS makes Kestrel (.NET) bind it too. Harmless elsewhere.
-    env: { ...process.env, PORT: String(port), WEBSITE_PORT: String(port), ASPNETCORE_URLS: `http://localhost:${port}` }
+    // User env first, then platform vars win: PORT is the cross-runtime convention; ASPNETCORE_URLS makes Kestrel (.NET) bind it too.
+    env: { ...process.env, ...(app.env || {}), PORT: String(port), WEBSITE_PORT: String(port), ASPNETCORE_URLS: `http://localhost:${port}` }
   });
   procs.set(app.name, child);
   app.pid = child.pid;
   app.port = port;
-  app.url = `http://${app.name}.localhost:${PORT}`; // pretty URL via the reverse proxy below
+  app.startedAt = new Date().toISOString();
+  app.url = `${PROTO}://${app.name}.localhost:${PORT}`; // pretty URL via the reverse proxy below
   setStatus(app.name, 'running');
   child.stdout.on('data', d => pushLog(app.name, d.toString()));
   child.stderr.on('data', d => pushLog(app.name, d.toString()));
-  child.on('exit', code => {
-    procs.delete(app.name);
-    const a = find(app.name);
-    if (a && a.status === 'running') { pushLog(app.name, `Process exited (code ${code})`); setStatus(app.name, 'stopped'); }
-  });
+  child.on('exit', code => onExit(app.name, code));
+}
+
+// Process died. If the user didn't stop it, auto-restart with exponential backoff — unless it's crash-looping.
+function onExit(name, code) {
+  procs.delete(name);
+  const a = find(name);
+  if (!a) return;
+  a.pid = null;
+  if (a.desired !== 'running') { if (a.status === 'running') setStatus(name, 'stopped'); return; }
+  const hist = (restartHist.get(name) || []).filter(t => Date.now() - t < RESTART_WINDOW);
+  if (hist.length >= RESTART_MAX) {
+    restartHist.set(name, hist);
+    pushLog(name, `Crashed ${hist.length}× in ${RESTART_WINDOW / 1000}s — giving up. Fix the app, then hit Start.`);
+    return setStatus(name, 'failed');
+  }
+  hist.push(Date.now()); restartHist.set(name, hist);
+  a.restarts = (a.restarts || 0) + 1;
+  const delay = Math.min(30_000, 1000 * 2 ** (hist.length - 1));
+  pushLog(name, `Process exited (code ${code}) — auto-restart #${a.restarts} in ${Math.round(delay / 1000)}s`);
+  setStatus(name, 'stopped');
+  setTimeout(() => { const app = find(name); if (app && app.desired === 'running') startApp(app); }, delay);
 }
 
 function stopApp(app) {
+  app.desired = 'stopped'; // explicit stop → don't auto-restart, don't auto-start on boot
+  restartHist.delete(app.name);
   killTree(app.pid);
   procs.delete(app.name);
   app.pid = null;
   setStatus(app.name, 'stopped');
+}
+
+// Bring an app back after a server boot: start in place if we already have its code, else (re)deploy to fetch it.
+function bootApp(app) {
+  if (app.cwd && fs.existsSync(app.cwd)) startApp(app);
+  else deploy(app);
+}
+
+// TCP-probe every running app. Repeated failures on a live pid = hung app → restart it (throttled to once/min).
+function healthCheck() {
+  for (const a of apps) {
+    if (a.status !== 'running' || !a.port) { healthFails.delete(a.name); continue; }
+    const sock = net.connect(a.port, '127.0.0.1');
+    let done = false;
+    const ok = () => { if (done) return; done = true; sock.destroy(); a.health = 'healthy'; healthFails.set(a.name, 0); };
+    const bad = () => {
+      if (done) return; done = true; sock.destroy();
+      const n = (healthFails.get(a.name) || 0) + 1; healthFails.set(a.name, n);
+      a.health = 'unhealthy';
+      if (n >= 3 && a.desired === 'running' && Date.now() - (lastHealthRestart.get(a.name) || 0) > 60_000) {
+        lastHealthRestart.set(a.name, Date.now()); healthFails.set(a.name, 0);
+        pushLog(a.name, `Health check failed ${n}× — restarting unresponsive app`);
+        stopApp(a); setTimeout(() => startApp(a), 800);
+      }
+    };
+    sock.once('connect', ok); sock.once('error', bad); sock.setTimeout(3000, bad);
+  }
+}
+
+// Sample host metrics into a ring buffer and fire threshold alerts. Started at boot.
+function startMetricSampler() {
+  const sample = () => {
+    const m = metrics();
+    metricHistory.push({ ts: m.ts, mem: m.mem.pct, disk: m.disk ? m.disk.pct : null });
+    while (metricHistory.length > METRIC_HISTORY) metricHistory.shift();
+    checkAlert('memory', m.mem.pct);
+    if (m.disk) checkAlert('disk', m.disk.pct);
+  };
+  sample();
+  setInterval(sample, METRIC_INTERVAL).unref();
+}
+function checkAlert(resource, pct) {
+  if (pct < ALERT_PCT || Date.now() - (lastAlert[resource] || 0) < ALERT_EVERY) return;
+  lastAlert[resource] = Date.now();
+  const to = process.env.NOTIFY_TO || process.env.GMAIL_USER;
+  if (to) sendMail(to, `[Jerrick Cloud] ${resource} at ${pct}%`,
+    `Host ${resource} usage is ${pct}% (alert threshold ${ALERT_PCT}%).\nFree up ${resource} on your Jerrick Cloud server.`, null);
+}
+
+// Resident memory of a child pid, via the OS (Node doesn't expose child RSS). Resolves bytes or null.
+// ponytail: per-pid only, no child-tree sum, no CPU% — a spawn per query. Enough for a home-server gauge.
+function pidRss(pid) {
+  return new Promise(resolve => {
+    if (!pid) return resolve(null);
+    const [cmd, args, parse] = IS_WIN
+      ? ['tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], o => { const m = o.match(/"([\d.,]+) K"\s*$/m); return m ? parseInt(m[1].replace(/[.,]/g, ''), 10) * 1024 : null; }]
+      : ['ps', ['-o', 'rss=', '-p', String(pid)], o => { const n = parseInt(o.trim(), 10); return isNaN(n) ? null : n * 1024; }];
+    let out = '';
+    const p = spawn(cmd, args);
+    p.stdout.on('data', d => out += d);
+    p.on('error', () => resolve(null));
+    p.on('close', () => { try { resolve(parse(out)); } catch (_) { resolve(null); } });
+  });
+}
+
+// Current HEAD (short sha) of a git working copy, or null. Used for deploy history / rollback.
+function gitHead(cwd) {
+  return new Promise(resolve => {
+    let out = '';
+    const p = spawn('git', ['rev-parse', '--short', 'HEAD'], { cwd });
+    p.stdout.on('data', d => out += d);
+    p.on('error', () => resolve(null));
+    p.on('close', () => resolve(out.trim() || null));
+  });
+}
+function recordDeploy(app, commit) {
+  app.deploys = [{ ts: new Date().toISOString(), commit }, ...(app.deploys || [])].slice(0, 20);
+  save();
+}
+
+// Extract a .zip into dir with no unzip dependency, using what the OS ships. Resolves true on success.
+// Windows: PowerShell Expand-Archive is the reliable native unzip (a bare `tar` may resolve to Git's GNU
+// tar, which can't read zips and rejects C:\ paths). Unix: unzip, then bsdtar as a fallback.
+function extractZip(zipPath, dir) {
+  const runTo = (cmd, args) => new Promise(r => { const p = spawn(cmd, args); p.on('error', () => r(false)); p.on('close', c => r(c === 0)); });
+  const bsdtar = () => runTo('tar', ['-xf', zipPath, '-C', dir]);
+  return IS_WIN
+    ? runTo('powershell', ['-NoProfile', '-Command', `Expand-Archive -LiteralPath '${zipPath}' -DestinationPath '${dir}' -Force`]).then(ok => ok || bsdtar())
+    : runTo('unzip', ['-o', zipPath, '-d', dir]).then(ok => ok || bsdtar());
 }
 
 // ---- google oauth (zero-dep; Authorization Code flow) ----
@@ -460,13 +610,29 @@ async function recordUser(user) {
   } catch (e) { console.error('recordUser:', e.message); }
 }
 
+// ---- host metrics (memory + disk) ----
+// Host-level only: total/used memory (os) and disk usage of the drive holding Jerrick Cloud (fs.statfs).
+// ponytail: per-app memory would need OS-specific process queries (tasklist/ps) — host gauges cover the
+//   "is my home server running out of RAM/disk" question; add per-pid sampling if you ever need it.
+function metrics() {
+  const total = os.totalmem(), free = os.freemem(), used = total - free;
+  const mem = { total, free, used, pct: Math.round(used / total * 100) };
+  let disk = null;
+  try { // statfs: Node 18.15+/19.6+. Missing on older Node -> disk stays null, UI shows "unavailable".
+    const s = fs.statfsSync(ROOT);
+    const dtotal = s.blocks * s.bsize, dfree = s.bavail * s.bsize, dused = dtotal - dfree;
+    disk = { total: dtotal, free: dfree, used: dused, pct: Math.round(dused / dtotal * 100) };
+  } catch (_) {}
+  return { mem, disk, ts: Date.now() };
+}
+
 // ---- http + api ----
 function json(res, obj, code = 200) { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); }
 function readBody(req) {
   return new Promise(r => { let b = ''; req.on('data', c => b += c); req.on('end', () => { try { r(JSON.parse(b || '{}')); } catch (_) { r({}); } }); });
 }
 
-// Reverse proxy: requests to <app>.localhost:PORT are forwarded to that app's internal port.
+// Reverse proxy: requests to <app>.localhost:PORT (or a mapped custom domain) are forwarded to that app's internal port.
 // *.localhost resolves to 127.0.0.1 in modern browsers with no DNS/hosts setup.
 function proxyToApp(name, req, res) {
   const app = find(name);
@@ -474,7 +640,7 @@ function proxyToApp(name, req, res) {
     res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(`<h2>502 &middot; ${name}</h2><p>This app is not running on Jerrick Cloud.</p>`);
   }
-  const headers = { ...req.headers, 'x-forwarded-host': req.headers.host, 'x-forwarded-proto': 'http', 'x-forwarded-for': req.socket.remoteAddress };
+  const headers = { ...req.headers, 'x-forwarded-host': req.headers.host, 'x-forwarded-proto': PROTO, 'x-forwarded-for': req.socket.remoteAddress };
   const up = http.request({ host: '127.0.0.1', port: app.port, method: req.method, path: req.url, headers }, upRes => {
     res.writeHead(upRes.statusCode, upRes.headers);
     upRes.pipe(res);
@@ -482,17 +648,31 @@ function proxyToApp(name, req, res) {
   up.on('error', e => { if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain' }); res.end('502 Bad Gateway: ' + e.message); });
   req.pipe(up);
 }
-// ponytail: HTTP only — WebSocket upgrades aren't proxied. Add server.on('upgrade') socket piping if a deployed app needs WS.
 
-const server = http.createServer(async (req, res) => {
-  // App subdomain -> reverse proxy to the running app.
+// Map an incoming Host header to an app name: an <app>.localhost subdomain, or a mapped custom domain.
+function hostToApp(hostname) {
+  if (hostname.endsWith('.localhost') && hostname.length > '.localhost'.length) return hostname.slice(0, -('.localhost'.length));
+  const a = apps.find(a => (a.domains || []).includes(hostname));
+  return a ? a.name : null;
+}
+
+const handler = async (req, res) => {
+  // App subdomain / custom domain -> reverse proxy to the running app.
   const hostname = (req.headers.host || '').split(':')[0];
-  if (hostname.endsWith('.localhost') && hostname.length > '.localhost'.length) {
-    return proxyToApp(hostname.slice(0, -('.localhost'.length)), req, res);
-  }
+  const proxied = hostToApp(hostname);
+  if (proxied) return proxyToApp(proxied, req, res);
 
   const u = new URL(req.url, 'http://localhost');
   const parts = u.pathname.split('/').filter(Boolean);
+
+  // ---- git-push webhook (PRE-auth: GitHub has no session cookie; authenticated by the per-app hook key) ----
+  if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'apps' && parts[3] === 'hook') {
+    const app = find(parts[2]);
+    if (!app || !app.hookKey || u.searchParams.get('key') !== app.hookKey) return json(res, { error: 'Bad hook key' }, 403);
+    pushLog(app.name, '🔔 Webhook received — redeploying');
+    stopApp(app); setTimeout(() => deploy(app), 500);
+    return json(res, { ok: true });
+  }
 
   // ---- auth gate (enforced only when Google OAuth is configured) ----
   if (AUTH_ON) {
@@ -511,6 +691,9 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (req.method === 'GET' && u.pathname === '/api/metrics') return json(res, metrics());
+  if (req.method === 'GET' && u.pathname === '/api/metrics/history') return json(res, metricHistory);
+
   if (req.method === 'GET' && u.pathname === '/api/me') {
     return json(res, AUTH_ON ? { auth: true, email: (req.user || {}).email, name: (req.user || {}).name } : { auth: false });
   }
@@ -523,26 +706,87 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (parts[0] === 'api' && parts[1] === 'apps') {
-    if (req.method === 'GET' && parts.length === 2) return json(res, apps);
+    // When auth is on, a user only sees/controls their own apps (plus legacy apps with no owner).
+    const mine = a => !AUTH_ON || !a.owner || (req.user && a.owner === req.user.email);
+    if (req.method === 'GET' && parts.length === 2) return json(res, apps.filter(mine));
 
     if (req.method === 'POST' && parts.length === 2) {
       const body = await readBody(req);
       const name = slugify(body.name);
       const source = String(body.source || '').trim();
       const token = String(body.token || '').trim(); // optional; used for the clone, never stored
+      const size = String(body.size || 'free').toLowerCase().slice(0, 20); // chosen plan; cosmetic (all apps run locally)
+      const zipB64 = String(body.zip || ''); // optional: base64 zip upload instead of a source
       if (!name) return json(res, { error: 'A valid name is required' }, 400);
       if (find(name)) return json(res, { error: `App "${name}" already exists` }, 409);
-      if (!source) return json(res, { error: 'A Git URL or local folder path is required' }, 400);
-      const app = { name, source, managed: isRemote(source), port: null, pid: null, status: 'queued', url: null, owner: req.user ? req.user.email : undefined, createdAt: new Date().toISOString() };
+
+      // Fields shared by every new app. hookKey authenticates the git-push webhook; desired drives auto-restart/boot.
+      const base = { name, size, port: null, pid: null, status: 'queued', url: null, env: {}, desired: 'running',
+        hookKey: crypto.randomBytes(12).toString('hex'), domains: [], deploys: [],
+        owner: req.user ? req.user.email : undefined, createdAt: new Date().toISOString() };
+
+      if (zipB64) { // zip upload → extract into workspaces/, deploy in place
+        const buf = Buffer.from(zipB64, 'base64');
+        if (!buf.length) return json(res, { error: 'Empty or invalid zip' }, 400);
+        if (buf.length > 50 * 1024 * 1024) return json(res, { error: 'Zip too large (max 50 MB)' }, 400);
+        const dir = path.join(WORKSPACES, name);
+        fs.mkdirSync(dir, { recursive: true });
+        const zipPath = path.join(dir, '_upload.zip');
+        fs.writeFileSync(zipPath, buf);
+        const app = { ...base, source: `zip:${name}`, managed: false, uploaded: true, cwd: dir };
+        apps.push(app); save();
+        setStatus(name, 'building'); pushLog(name, `Extracting ${(buf.length / 1024).toFixed(0)} KB upload…`);
+        extractZip(zipPath, dir).then(ok => {
+          try { fs.unlinkSync(zipPath); } catch (_) {}
+          if (!ok) { pushLog(name, 'Failed to extract zip (no tar/unzip on this host?)'); return setStatus(name, 'failed'); }
+          deploy(app);
+        });
+        return json(res, app, 201);
+      }
+
+      if (!source) return json(res, { error: 'A Git URL, local folder path, or zip upload is required' }, 400);
+      const app = { ...base, source, managed: isRemote(source) };
       apps.push(app); save();
       deploy(app, token); // fire and forget; progress streams over SSE
       return json(res, app, 201);
     }
 
     const app = find(parts[2]);
-    if (!app) return json(res, { error: 'Not found' }, 404);
+    if (!app || !mine(app)) return json(res, { error: 'Not found' }, 404); // owned by someone else → 404, not 403
 
     if (req.method === 'GET' && parts.length === 3) return json(res, app);
+
+    if (req.method === 'GET' && parts[3] === 'stats' && parts.length === 4) {
+      const rss = await pidRss(app.pid);
+      const uptimeSec = app.startedAt && app.status === 'running' ? Math.round((Date.now() - new Date(app.startedAt)) / 1000) : 0;
+      return json(res, { status: app.status, health: app.health || 'unknown', rss, uptimeSec, restarts: app.restarts || 0 });
+    }
+
+    if (req.method === 'PUT' && parts[3] === 'env' && parts.length === 4) {
+      const body = await readBody(req);
+      const env = {}; // keep only valid shell identifiers; stringify values
+      for (const [k, v] of Object.entries(body.env || {})) if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) env[k] = String(v);
+      app.env = env; save();
+      return json(res, { ok: true, env }); // takes effect on next start/restart
+    }
+
+    if (req.method === 'POST' && parts[3] === 'domains' && parts.length === 4) {
+      const body = await readBody(req);
+      const d = String(body.domain || '').trim().toLowerCase();
+      if (!/^[a-z0-9.-]+\.[a-z0-9.-]+$/.test(d)) return json(res, { error: 'Enter a valid hostname, e.g. app.example.com' }, 400);
+      if (apps.some(a => a !== app && (a.domains || []).includes(d))) return json(res, { error: 'Domain already mapped to another app' }, 409);
+      app.domains = [...new Set([...(app.domains || []), d])]; save();
+      return json(res, app);
+    }
+    if (req.method === 'DELETE' && parts[3] === 'domains' && parts.length === 5) {
+      app.domains = (app.domains || []).filter(d => d !== decodeURIComponent(parts[4])); save();
+      return json(res, app);
+    }
+
+    if (req.method === 'GET' && parts[3] === 'logs' && parts[4] === 'download') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Disposition': `attachment; filename="${slugify(app.name)}.log"` });
+      return fs.createReadStream(logFile(app.name)).on('error', () => res.end('(no logs yet)')).pipe(res);
+    }
 
     if (req.method === 'GET' && parts[3] === 'logs') {
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
@@ -562,16 +806,24 @@ const server = http.createServer(async (req, res) => {
       else if (action === 'start') startApp(app);
       else if (action === 'restart') { stopApp(app); setTimeout(() => startApp(app), 800); }
       else if (action === 'redeploy') { stopApp(app); setTimeout(() => deploy(app), 800); }
+      else if (action === 'rollback') {
+        if (!app.managed) return json(res, { error: 'Rollback is available for Git apps only' }, 400);
+        const body = await readBody(req);
+        const commit = String(body.commit || '').trim();
+        if (!/^[0-9a-f]{7,40}$/i.test(commit)) return json(res, { error: 'A commit hash is required' }, 400);
+        stopApp(app); setTimeout(() => deploy(app, null, commit), 500);
+      }
       else return json(res, { error: 'Unknown action' }, 400);
       return json(res, app);
     }
 
     if (req.method === 'DELETE' && parts.length === 3) {
       stopApp(app);
-      // Only delete files we created (git clones under workspaces/). Never touch a user's local folder.
-      if (app.managed && app.cwd && app.cwd.startsWith(WORKSPACES)) {
+      // Only delete files we created (git clones / zip uploads under workspaces/). Never touch a user's local folder.
+      if ((app.managed || app.uploaded) && app.cwd && app.cwd.startsWith(WORKSPACES)) {
         try { fs.rmSync(app.cwd, { recursive: true, force: true }); } catch (_) {}
       }
+      try { fs.rmSync(logFile(app.name), { force: true }); } catch (_) {}
       apps = apps.filter(a => a.name !== app.name); save();
       logbuf.delete(app.name); clients.delete(app.name);
       return json(res, { ok: true });
@@ -579,6 +831,23 @@ const server = http.createServer(async (req, res) => {
   }
 
   json(res, { error: 'Not found' }, 404);
+};
+
+const server = SSL ? https.createServer(SSL, handler) : http.createServer(handler);
+
+// WebSocket upgrades: raw-pipe the client socket to the target app's port (subdomain or custom domain).
+server.on('upgrade', (req, socket, head) => {
+  const name = hostToApp((req.headers.host || '').split(':')[0]);
+  const app = name && find(name);
+  if (!app || app.status !== 'running' || !app.port) return socket.destroy();
+  const up = net.connect(app.port, '127.0.0.1', () => {
+    up.write(`${req.method} ${req.url} HTTP/1.1\r\n` +
+      Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n');
+    if (head && head.length) up.write(head);
+    socket.pipe(up); up.pipe(socket);
+  });
+  up.on('error', () => socket.destroy());
+  socket.on('error', () => up.destroy());
 });
 
 // ---- startup / self-check ----
@@ -613,10 +882,42 @@ if (process.argv.includes('--check')) {
   assert.equal(new Date('2026-08-10T12:34:56.789Z').toISOString().replace(/[:-]|\.\d{3}/g, ''), '20260810T123456Z');
   // Persistence is a safe no-op when unconfigured (no R2/Cosmos env) — never throws.
   assert.doesNotThrow(() => recordUser({ email: 'x@y.com', name: 'X' }));
+  // Metrics: memory always present with a sane 0–100 percentage; disk is null-or-valid.
+  const mtr = metrics();
+  assert.ok(mtr.mem.total > 0 && mtr.mem.pct >= 0 && mtr.mem.pct <= 100);
+  assert.ok(mtr.disk === null || (mtr.disk.total > 0 && mtr.disk.pct >= 0 && mtr.disk.pct <= 100));
+  // tasklist memory parse: "12,345 K" -> bytes (thousands separators stripped).
+  const winMem = '"node.exe","1234","Console","1","12,345 K"'.match(/"([\d.,]+) K"\s*$/m);
+  assert.equal(parseInt(winMem[1].replace(/[.,]/g, ''), 10) * 1024, 12345 * 1024);
+  // Custom-domain validation: accept an FQDN, reject a bare word.
+  assert.ok(/^[a-z0-9.-]+\.[a-z0-9.-]+$/.test('app.example.com'));
+  assert.ok(!/^[a-z0-9.-]+\.[a-z0-9.-]+$/.test('localhost'));
+  // Rollback commit guard: hex 7–40, nothing else.
+  assert.ok(/^[0-9a-f]{7,40}$/i.test('a1b2c3d') && !/^[0-9a-f]{7,40}$/i.test('nope'));
+  // Auto-restart backoff: exponential, capped at 30s.
+  const backoff = n => Math.min(30_000, 1000 * 2 ** (n - 1));
+  assert.equal(backoff(1), 1000); assert.equal(backoff(3), 4000); assert.equal(backoff(10), 30_000);
+  // env var key filter: keep valid shell identifiers only.
+  assert.ok(/^[A-Za-z_][A-Za-z0-9_]*$/.test('MY_KEY') && !/^[A-Za-z_][A-Za-z0-9_]*$/.test('1BAD'));
   findFreePort(PORT_BASE, new Set()).then(p => { assert.ok(p >= PORT_BASE); console.log('self-check OK'); process.exit(0); });
 } else {
-  // Clean up any orphaned child processes from a previous run, then start fresh.
-  for (const a of apps) { if (a.pid) killTree(a.pid); a.pid = null; a.status = 'stopped'; }
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  // Clean up orphaned children from a previous run; migrate old records; mark desired-running apps for boot.
+  for (const a of apps) {
+    if (a.pid) killTree(a.pid);
+    a.pid = null;
+    a.health = 'unknown';
+    if (a.desired === undefined) a.desired = a.status === 'running' ? 'running' : 'stopped'; // migrate pre-desired records
+    if (!a.hookKey) a.hookKey = crypto.randomBytes(12).toString('hex'); // backfill webhooks/env/domains onto legacy apps
+    if (!a.env) a.env = {};
+    if (!a.domains) a.domains = [];
+    if (!a.deploys) a.deploys = [];
+    a.status = a.desired === 'running' ? 'queued' : 'stopped';
+  }
   save();
-  server.listen(PORT, () => console.log(`Jerrick Cloud running -> http://localhost:${PORT}`));
+  server.listen(PORT, () => console.log(`Jerrick Cloud running -> ${PROTO}://localhost:${PORT}`));
+  // Bring back everything that was running before the reboot (staggered so ports settle), then watch health + metrics.
+  apps.filter(a => a.desired === 'running').forEach((a, i) => setTimeout(() => bootApp(a), 800 + i * 500));
+  setInterval(healthCheck, HEALTH_INTERVAL).unref();
+  startMetricSampler();
 }

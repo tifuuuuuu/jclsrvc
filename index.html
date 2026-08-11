@@ -171,6 +171,40 @@
              height: 60vh; overflow: auto; white-space: pre-wrap; }
   .console div { min-height: 1.25em; }
 
+  /* ---- metrics gauges ---- */
+  .gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; margin-bottom: 18px; }
+  .gauge { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); padding: 18px; box-shadow: var(--shadow-sm); }
+  .gauge .g-top { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+  .gauge .g-label { font-weight: 650; font-size: 14px; }
+  .gauge .g-val { font-size: 22px; font-weight: 700; letter-spacing: -.01em; }
+  .bar { height: 10px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+  .bar > span { display: block; height: 100%; width: 0; background: var(--grad); border-radius: 999px; transition: width .5s ease; }
+  .bar.warn > span { background: linear-gradient(90deg, #f59e0b, #f87171); }
+  .gauge .g-sub { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+  .spark { width: 100%; height: 26px; margin-top: 10px; display: block; }
+  .spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+
+  /* ---- env var editor + inline inputs ---- */
+  .kvrow { display: flex; gap: 8px; margin-bottom: 8px; }
+  .kvrow input { flex: 1; min-width: 0; height: 38px; border: 1px solid var(--border-2); border-radius: var(--r-sm);
+                 padding: 0 12px; background: var(--surface-2); color: var(--text); font-family: "SFMono-Regular", ui-monospace, Consolas, monospace; font-size: 13px; }
+  .kvrow input:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); background: var(--surface); }
+  .kvrow .rm { flex: 0 0 auto; width: 38px; height: 38px; border: 1px solid var(--border-2); border-radius: var(--r-sm);
+               background: var(--surface-2); color: var(--bad); cursor: pointer; font-size: 16px; }
+  .inp { height: 38px; border: 1px solid var(--border-2); border-radius: var(--r-sm); padding: 0 12px;
+         background: var(--surface-2); color: var(--text); font-size: 13px; font-family: inherit; }
+  .inp:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); background: var(--surface); }
+  .card h3 { font-size: 14px; font-weight: 650; margin-bottom: 8px; }
+  .health-ok { color: var(--ok); font-weight: 600; }
+  .health-bad { color: var(--bad); font-weight: 600; }
+  .health-unknown { color: var(--muted); }
+
+  /* ---- size / plan picker (reuses .source cards) ---- */
+  .size-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  .size-grid .source { text-align: left; padding: 12px 14px; }
+  .size-grid .source .s-name { font-weight: 650; font-size: 13.5px; }
+  .size-grid .source .s-spec { font-size: 12px; color: var(--muted); margin-top: 3px; }
+
   /* ---- deployment sources ---- */
   .source-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-bottom: 18px; }
   .source { border: 1px solid var(--border-2); border-radius: var(--r-sm); padding: 16px; text-align: center; background: var(--surface);
@@ -224,6 +258,8 @@
   </div>
   <div class="spacer"></div>
   <div class="avatar" id="me" title="jerrickjamesdecena@gmail.com">JD</div>
+  <a href="/auth/logout" id="signout" class="btn" style="display:none; margin-left:12px"
+     onclick="return confirm('Sign out of Jerrick Cloud?')">Sign out</a>
 </header>
 
 <!-- ===================== LIST SCREEN ===================== -->
@@ -274,6 +310,7 @@
       <div class="nav-item" data-panel="scale"><svg viewBox="0 0 24 24"><path d="M4 20V10h4v10zm6 0V4h4v16zm6 0v-7h4v7z"/></svg>Scale up (plan)</div>
       <div class="nav-item" data-panel="domains"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2c1.7 0 3.9 3.2 4 8H8c.1-4.8 2.3-8 4-8zm0 16c-1.7 0-3.9-3.2-4-8h8c-.1 4.8-2.3 8-4 8z"/></svg>Custom domains</div>
       <div class="nav-group">Monitoring</div>
+      <div class="nav-item" data-panel="metrics"><svg viewBox="0 0 24 24"><path d="M4 20V10h4v10zm6 0V4h4v16zm6 0v-7h4v7z"/></svg>Metrics</div>
       <div class="nav-item" data-panel="logstream"><svg viewBox="0 0 24 24"><path d="M4 5h16v3H4zm0 5h16v3H4zm0 5h10v3H4z"/></svg>Log stream</div>
     </nav>
 
@@ -283,12 +320,15 @@
         <div class="card">
           <div class="essentials">
             <div class="kv"><span class="k">Status</span><span class="v" id="ov-status"></span></div>
+            <div class="kv"><span class="k">Health</span><span class="v" id="ov-health"><span class="health-unknown">—</span></span></div>
+            <div class="kv"><span class="k">Uptime</span><span class="v" id="ov-uptime">—</span></div>
             <div class="kv"><span class="k">URL</span><span class="v" id="ov-url"></span></div>
             <div class="kv"><span class="k">Source</span><span class="v mono" id="ov-source"></span></div>
             <div class="kv"><span class="k">Source type</span><span class="v" id="ov-type"></span></div>
             <div class="kv"><span class="k">Port</span><span class="v mono" id="ov-port"></span></div>
             <div class="kv"><span class="k">Created</span><span class="v" id="ov-created"></span></div>
             <div class="kv"><span class="k">Runtime stack</span><span class="v" id="ov-runtime">Auto-detected</span></div>
+            <div class="kv"><span class="k">App Service plan</span><span class="v" id="ov-size">Free</span></div>
             <div class="kv"><span class="k">Region</span><span class="v">Local · Jerrick Cloud</span></div>
           </div>
         </div>
@@ -313,20 +353,36 @@
             <button class="btn" onclick="selectPanel('logstream')">View build logs</button>
           </div>
         </div>
+
+        <div class="card" style="max-width:640px" id="hook-card">
+          <h3>Auto-deploy on git push</h3>
+          <p class="desc" style="margin-bottom:10px">Add this as a GitHub webhook (repo → Settings → Webhooks, content type <span class="mono">application/json</span>). Every push redeploys.</p>
+          <div style="display:flex; gap:8px">
+            <input id="hook-url" class="inp mono" readonly style="flex:1; font-size:12px">
+            <button class="btn" onclick="copyHook()">Copy</button>
+          </div>
+        </div>
+
+        <div class="card" style="max-width:640px">
+          <h3>Deployment history</h3>
+          <p class="desc" style="margin-bottom:10px">Recent deploys. Roll back a Git app to any previous commit.</p>
+          <div class="tbl-wrap">
+            <table><thead><tr><th>When</th><th>Commit</th><th></th></tr></thead><tbody id="deploy-tbody"></tbody></table>
+          </div>
+        </div>
       </section>
 
-      <!-- Configuration (static for now) -->
+      <!-- Configuration: editable environment variables -->
       <section class="panel" id="p-config">
         <h2 class="blade-h">Configuration</h2>
-        <p class="desc">Environment variables passed to your app at runtime. <span class="muted">(Editing coming soon — PORT is injected automatically.)</span></p>
-        <div class="tbl-wrap">
-          <table>
-            <thead><tr><th>Name</th><th>Value</th></tr></thead>
-            <tbody>
-              <tr><td class="mono">PORT</td><td class="mono">&lt;assigned by Jerrick Cloud&gt;</td></tr>
-              <tr><td class="mono">NODE_ENV</td><td class="mono">production</td></tr>
-            </tbody>
-          </table>
+        <p class="desc">Environment variables passed to your app at runtime. <b class="mono">PORT</b> is injected automatically. Changes apply on the next start / restart.</p>
+        <div class="card" style="max-width:720px">
+          <div id="env-rows"></div>
+          <button class="btn" onclick="addEnvRow()">＋ Add variable</button>
+          <div style="margin-top:16px; display:flex; gap:12px; align-items:center">
+            <button class="btn primary" onclick="saveEnv()">Save</button>
+            <span class="muted" id="env-msg"></span>
+          </div>
         </div>
       </section>
 
@@ -334,16 +390,53 @@
       <section class="panel" id="p-scale">
         <h2 class="blade-h">Scale up (plan)</h2>
         <p class="desc">Pricing tiers are cosmetic for now — every app runs on your local machine.</p>
-        <div class="info-bar">Current tier: <b>Local (Free)</b> — runs as a child process on this machine.</div>
+        <div class="info-bar">Current plan: <b id="scale-plan">Free</b> — runs as a child process on this machine.</div>
       </section>
 
-      <!-- Domains (static) -->
+      <!-- Custom domains (mapped via the reverse proxy) -->
       <section class="panel" id="p-domains">
         <h2 class="blade-h">Custom domains</h2>
-        <p class="desc">Jerrick Cloud's built-in reverse proxy gives every running app a subdomain. Bring-your-own custom domains are the next milestone.</p>
-        <div class="tbl-wrap">
-          <table><thead><tr><th>Domain</th><th>Status</th></tr></thead><tbody id="dom-tbody"></tbody></table>
+        <p class="desc">Every running app gets a <span class="mono">.localhost</span> subdomain. To use your own hostname, point its DNS at this server, then add it here — the reverse proxy routes it. For HTTPS, set <span class="mono">SSL_CERT</span> / <span class="mono">SSL_KEY</span> on the server.</p>
+        <div class="card" style="max-width:640px">
+          <div style="display:flex; gap:8px; margin-bottom:12px">
+            <input id="dom-input" class="inp" placeholder="app.example.com" style="flex:1" onkeydown="if(event.key==='Enter')addDomain()">
+            <button class="btn primary" onclick="addDomain()">Add domain</button>
+          </div>
+          <div class="err" id="dom-err"></div>
+          <div class="tbl-wrap">
+            <table><thead><tr><th>Domain</th><th>Status</th><th></th></tr></thead><tbody id="dom-tbody"></tbody></table>
+          </div>
         </div>
+      </section>
+
+      <!-- Metrics (live host memory + disk) -->
+      <section class="panel" id="p-metrics">
+        <h2 class="blade-h">Metrics</h2>
+        <p class="desc">This app's process, plus live memory and disk usage of the host machine.</p>
+        <div class="card" style="padding:14px 18px; margin-bottom:16px">
+          <div class="essentials">
+            <div class="kv"><span class="k">Process memory</span><span class="v mono" id="st-rss">—</span></div>
+            <div class="kv"><span class="k">Uptime</span><span class="v" id="st-uptime">—</span></div>
+            <div class="kv"><span class="k">Restarts</span><span class="v" id="st-restarts">—</span></div>
+            <div class="kv"><span class="k">Health</span><span class="v" id="st-health"><span class="health-unknown">—</span></span></div>
+          </div>
+        </div>
+        <div class="gauges">
+          <div class="gauge">
+            <div class="g-top"><span class="g-label">Host memory</span><span class="g-val" id="mem-val">—</span></div>
+            <div class="bar"><span id="mem-bar"></span></div>
+            <svg class="spark" id="mem-spark" viewBox="0 0 100 26" preserveAspectRatio="none"></svg>
+            <div class="g-sub" id="mem-sub">Waiting for first sample…</div>
+          </div>
+          <div class="gauge">
+            <div class="g-top"><span class="g-label">Host disk</span><span class="g-val" id="disk-val">—</span></div>
+            <div class="bar"><span id="disk-bar"></span></div>
+            <svg class="spark" id="disk-spark" viewBox="0 0 100 26" preserveAspectRatio="none"></svg>
+            <div class="g-sub" id="disk-sub">Waiting for first sample…</div>
+          </div>
+        </div>
+        <p class="desc">Sample history <span class="muted">· alerts email at ≥85%</span></p>
+        <div class="console" id="metrics-log" style="height:32vh"></div>
       </section>
 
       <!-- Log stream (live) -->
@@ -368,8 +461,18 @@
       </div>
       <div class="field">
         <label>Source</label>
-        <input id="c-source" placeholder="https://github.com/you/repo  —or—  C:\path\to\app" autocomplete="off" required>
-        <div class="hint">A Git URL (cloned) or a local folder path (run in place). Node, Python, .NET, or any repo with a <span class="mono">Procfile</span>.</div>
+        <input id="c-source" placeholder="https://github.com/you/repo  —or—  C:\path\to\app" autocomplete="off">
+        <div class="hint">A Git URL (cloned) or a local folder path (run in place). Node, Python, .NET, or any repo with a <span class="mono">Procfile</span>. <b>Or</b> upload a .zip below.</div>
+      </div>
+      <div class="field">
+        <label>Upload a .zip <span class="muted" style="font-weight:400">— optional, instead of a source</span></label>
+        <input id="c-zip" type="file" accept=".zip" class="inp" style="width:100%; padding-top:7px">
+        <div class="hint">Zip the app folder with its manifest (package.json / requirements.txt / …) at the root. Max 50 MB.</div>
+      </div>
+      <div class="field">
+        <label>App Service plan (size)</label>
+        <div class="size-grid" id="c-sizes"></div>
+        <div class="hint">Sizes are cosmetic for now — every app runs on your local machine. The plan is recorded and shown on the app.</div>
       </div>
       <div class="field">
         <label>Access token <span class="muted" style="font-weight:400">— optional, for private GitHub repos</span></label>
@@ -389,11 +492,25 @@
   const $ = s => document.querySelector(s);
   let es = null;          // SSE connection
   let currentName = null; // open app
+  let currentApp = null;  // last-rendered app object (for env / domains / webhook)
+  let statsTimer = null;  // per-app process-stats poller
 
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const badge = s => `<span class="status-badge s-${s}">${esc(s)}</span>`;
   const api = (p, opts) => fetch('/api/apps' + p, opts).then(r => r.json());
   const CUBE = '<svg viewBox="0 0 24 24" fill="#fff"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5zm0 2.3 6.5 3.6L12 11.5 5.5 7.9 12 4.3zM5 9.6l6 3.3v6.8l-6-3.3V9.6zm14 0v6.8l-6 3.3v-6.8l6-3.3z"/></svg>';
+
+  // App Service plans (Azure-style tiers). Cosmetic — every app runs locally — but recorded per app.
+  const SIZES = [
+    { id: 'free',     name: 'Free (F1)',      spec: '1 GB RAM · shared' },
+    { id: 'basic',    name: 'Basic (B1)',     spec: '1.75 GB RAM · 1 vCPU' },
+    { id: 'standard', name: 'Standard (S1)',  spec: '3.5 GB RAM · 2 vCPU' },
+    { id: 'premium',  name: 'Premium (P1v2)', spec: '8 GB RAM · 2 vCPU' },
+  ];
+  let selectedSize = 'free';
+  const sizeLabel = id => { const s = SIZES.find(s => s.id === id); return s ? `${s.name} — ${s.spec}` : (id || 'Free'); };
+
+  const fmtBytes = b => { const u = ['B','KB','MB','GB','TB']; let i = 0, n = Number(b) || 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return n.toFixed(i && n < 10 ? 1 : 0) + ' ' + u[i]; };
 
   // ---------- auth (avatar shows the signed-in Google user; click to sign out) ----------
   fetch('/api/me').then(r => r.json()).then(m => {
@@ -403,11 +520,13 @@
     el.textContent = (m.email[0] || '?').toUpperCase();
     el.style.cursor = 'pointer';
     el.onclick = () => { if (confirm('Sign out of Jerrick Cloud?')) location.href = '/auth/logout'; };
+    const out = $('#signout'); if (out) out.style.display = 'inline-flex';
   }).catch(() => {});
 
   // ---------- list screen ----------
   async function showList() {
     if (es) { es.close(); es = null; }
+    stopMetrics(); stopStats();
     currentName = null;
     $('#screen-app').style.display = 'none';
     $('#screen-list').style.display = 'block';
@@ -440,9 +559,36 @@
     renderApp(a);
     selectPanel('overview');
     connectLogs(name);
+    startStats(name);
+  }
+
+  // ---- per-app process stats (memory / uptime / restarts / health), polled while an app is open ----
+  function startStats(name) { stopStats(); loadStats(); statsTimer = setInterval(loadStats, 5000); }
+  function stopStats() { if (statsTimer) { clearInterval(statsTimer); statsTimer = null; } }
+  const fmtDuration = sec => {
+    if (sec < 60) return sec + 's';
+    const m = Math.floor(sec / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+    return d ? `${d}d ${h % 24}h` : h ? `${h}h ${m % 60}m` : `${m}m`;
+  };
+  const healthHtml = (h, status) => status !== 'running' ? '<span class="health-unknown">—</span>'
+    : h === 'healthy' ? '<span class="health-ok">● Healthy</span>'
+    : h === 'unhealthy' ? '<span class="health-bad">● Unhealthy</span>'
+    : '<span class="health-unknown">● Checking…</span>';
+  async function loadStats() {
+    if (!currentName) return;
+    let s;
+    try { s = await fetch(`/api/apps/${currentName}/stats`).then(r => r.json()); } catch (_) { return; }
+    if (s.error) return;
+    const up = s.uptimeSec ? fmtDuration(s.uptimeSec) : '—';
+    const rss = s.rss ? fmtBytes(s.rss) : '—';
+    const health = healthHtml(s.health, s.status);
+    $('#ov-health').innerHTML = health; $('#ov-uptime').textContent = up;
+    $('#st-rss').textContent = rss; $('#st-uptime').textContent = up;
+    $('#st-restarts').textContent = s.restarts || 0; $('#st-health').innerHTML = health;
   }
 
   function renderApp(a) {
+    currentApp = a;
     $('#app-name').textContent = a.name;
     $('#app-crumb').textContent = a.name;
     $('#ov-status').innerHTML = badge(a.status);
@@ -450,17 +596,95 @@
       ? `<a href="${esc(a.url)}" target="_blank">${esc(a.url)}</a>`
       : '<span class="muted">— (app not running)</span>';
     $('#ov-source').textContent = a.source;
-    $('#ov-type').textContent = a.managed ? 'Git repository (cloned)' : 'Local folder (in place)';
+    $('#ov-type').textContent = a.uploaded ? 'Zip upload (extracted)' : a.managed ? 'Git repository (cloned)' : 'Local folder (in place)';
     $('#ov-port').textContent = a.port || '—';
     $('#ov-created').textContent = a.createdAt ? new Date(a.createdAt).toLocaleString() : '';
     $('#ov-runtime').textContent = a.runtime || 'Auto-detected';
+    $('#ov-size').textContent = sizeLabel(a.size);
+    $('#scale-plan').textContent = sizeLabel(a.size);
     $('#dep-source').textContent = a.source;
-    $('#dom-tbody').innerHTML = a.url && a.status === 'running'
-      ? `<tr><td class="mono">${esc(a.url.replace('http://', ''))}</td><td>${badge(a.status)}</td></tr>` +
-        `<tr><td class="mono">localhost:${esc(a.port)} <span class="muted">(direct)</span></td><td>${badge(a.status)}</td></tr>`
-      : `<tr><td colspan="2" class="muted">App not running.</td></tr>`;
+    // Webhook URL (hide if this app has no key — legacy apps created before webhooks existed)
+    $('#hook-card').style.display = a.hookKey ? '' : 'none';
+    if (a.hookKey) $('#hook-url').value = `${location.origin}/api/apps/${a.name}/hook?key=${a.hookKey}`;
+    renderDeploys(a);
+    renderEnv(a);
+    renderDomains(a);
     renderToolbar(a);
   }
+
+  // ---- deploy history + rollback ----
+  function renderDeploys(a) {
+    const rows = (a.deploys || []);
+    $('#deploy-tbody').innerHTML = rows.length
+      ? rows.map((d, i) => `<tr>
+          <td>${esc(new Date(d.ts).toLocaleString())}</td>
+          <td class="mono">${esc(d.commit || '—')}</td>
+          <td>${i === 0 ? '<span class="muted">current</span>' : `<button class="btn" style="height:30px;padding:0 12px" onclick="rollback('${esc(d.commit)}')">Roll back</button>`}</td>
+        </tr>`).join('')
+      : `<tr><td colspan="3" class="muted">No deploys recorded yet${a.managed ? '' : ' (history is tracked for Git apps)'}.</td></tr>`;
+  }
+  async function rollback(commit) {
+    if (!confirm(`Roll back to commit ${commit}? This redeploys the app at that commit.`)) return;
+    await fetch(`/api/apps/${currentName}/rollback`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commit }) });
+    selectPanel('logstream');
+  }
+
+  // ---- env var editor ----
+  function envRow(k = '', v = '') {
+    return `<div class="kvrow">
+      <input class="env-k" placeholder="KEY" value="${esc(k)}" autocomplete="off" spellcheck="false">
+      <input class="env-v" placeholder="value" value="${esc(v)}" autocomplete="off" spellcheck="false">
+      <button class="rm" title="Remove" onclick="this.parentElement.remove()">✕</button>
+    </div>`;
+  }
+  function renderEnv(a) {
+    const e = a.env || {};
+    const keys = Object.keys(e);
+    $('#env-rows').innerHTML = keys.length ? keys.map(k => envRow(k, e[k])).join('') : envRow();
+    $('#env-msg').textContent = '';
+  }
+  function addEnvRow() { $('#env-rows').insertAdjacentHTML('beforeend', envRow()); }
+  async function saveEnv() {
+    const env = {};
+    document.querySelectorAll('#env-rows .kvrow').forEach(row => {
+      const k = row.querySelector('.env-k').value.trim();
+      const v = row.querySelector('.env-v').value;
+      if (k) env[k] = v;
+    });
+    const r = await fetch(`/api/apps/${currentName}/env`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ env }) });
+    const j = await r.json();
+    if (currentApp) currentApp.env = j.env || env;
+    $('#env-msg').textContent = 'Saved — applies on next start / restart.';
+  }
+
+  // ---- custom domains ----
+  function renderDomains(a) {
+    const running = a.status === 'running';
+    const custom = (a.domains || []).map(d =>
+      `<tr><td class="mono">${esc(d)}</td><td>${running ? badge('running') : '<span class="muted">idle</span>'}</td>
+        <td><button class="btn" style="height:30px;padding:0 12px" onclick="removeDomain('${esc(d)}')">Remove</button></td></tr>`).join('');
+    const builtin = running
+      ? `<tr><td class="mono">${esc((a.url || '').replace(/^https?:\/\//, ''))} <span class="muted">(subdomain)</span></td><td>${badge('running')}</td><td></td></tr>` +
+        `<tr><td class="mono">localhost:${esc(a.port)} <span class="muted">(direct)</span></td><td>${badge('running')}</td><td></td></tr>`
+      : '';
+    $('#dom-tbody').innerHTML = custom + builtin || `<tr><td colspan="3" class="muted">No domains yet. App not running.</td></tr>`;
+    $('#dom-err').textContent = '';
+  }
+  async function addDomain() {
+    const domain = $('#dom-input').value.trim();
+    if (!domain) return;
+    const r = await fetch(`/api/apps/${currentName}/domains`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ domain }) });
+    const j = await r.json();
+    if (j.error) { $('#dom-err').textContent = j.error; return; }
+    $('#dom-input').value = ''; currentApp = j; renderDomains(j);
+  }
+  async function removeDomain(domain) {
+    const r = await fetch(`/api/apps/${currentName}/domains/${encodeURIComponent(domain)}`, { method: 'DELETE' });
+    const j = await r.json();
+    currentApp = j; renderDomains(j);
+  }
+
+  function copyHook() { navigator.clipboard.writeText($('#hook-url').value).then(() => { const b = event.target; const t = b.textContent; b.textContent = 'Copied'; setTimeout(() => b.textContent = t, 1200); }); }
 
   function renderToolbar(a) {
     const running = a.status === 'running';
@@ -510,12 +734,64 @@
     if (atBottom) c.scrollTop = c.scrollHeight;
   }
 
+  // ---------- metrics (host memory + disk, polled while the Metrics panel is open) ----------
+  let metricsTimer = null, memHist = [], diskHist = [];
+  function stopMetrics() { if (metricsTimer) { clearInterval(metricsTimer); metricsTimer = null; } }
+  async function startMetrics() {
+    stopMetrics();
+    $('#metrics-log').innerHTML = '';
+    memHist = []; diskHist = [];
+    try { // seed the sparklines with server-side history so the chart isn't empty on open
+      const h = await fetch('/api/metrics/history').then(r => r.json());
+      memHist = h.map(x => x.mem); diskHist = h.map(x => x.disk);
+      drawSpark('mem-spark', memHist); drawSpark('disk-spark', diskHist);
+    } catch (_) {}
+    pollMetrics();
+    metricsTimer = setInterval(pollMetrics, 4000);
+  }
+  function drawSpark(id, vals) {
+    const el = $('#' + id); if (!el) return;
+    const v = vals.filter(x => x != null);
+    if (v.length < 2) { el.innerHTML = ''; return; }
+    const n = v.length;
+    const pts = v.map((y, i) => `${(i / (n - 1) * 100).toFixed(1)},${(26 - y / 100 * 24 - 1).toFixed(1)}`).join(' ');
+    el.innerHTML = `<polyline points="${pts}"/>`;
+  }
+  function setGauge(prefix, g) {
+    const val = $('#' + prefix + '-val'), bar = $('#' + prefix + '-bar'), sub = $('#' + prefix + '-sub');
+    if (!g) { val.textContent = 'n/a'; bar.style.width = '0'; sub.textContent = 'Unavailable on this system.'; return; }
+    val.textContent = g.pct + '%';
+    bar.style.width = g.pct + '%';
+    bar.parentElement.classList.toggle('warn', g.pct >= 85);
+    sub.textContent = `${fmtBytes(g.used)} used of ${fmtBytes(g.total)} · ${fmtBytes(g.free)} free`;
+  }
+  async function pollMetrics() {
+    let m;
+    try { m = await fetch('/api/metrics').then(r => r.json()); } catch (_) { return; }
+    setGauge('mem', m.mem);
+    setGauge('disk', m.disk);
+    memHist.push(m.mem.pct); diskHist.push(m.disk ? m.disk.pct : null);
+    if (memHist.length > 120) { memHist.shift(); diskHist.shift(); }
+    drawSpark('mem-spark', memHist); drawSpark('disk-spark', diskHist);
+    const t = new Date(m.ts).toLocaleTimeString();
+    const line = `[${t}] memory ${m.mem.pct}% (${fmtBytes(m.mem.used)} / ${fmtBytes(m.mem.total)})` +
+      (m.disk ? `  ·  disk ${m.disk.pct}% (${fmtBytes(m.disk.used)} / ${fmtBytes(m.disk.total)})` : '  ·  disk n/a');
+    const c = $('#metrics-log');
+    const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight < 40;
+    const div = document.createElement('div');
+    div.textContent = line;
+    c.appendChild(div);
+    while (c.childElementCount > 200) c.removeChild(c.firstChild); // keep the log bounded
+    if (atBottom) c.scrollTop = c.scrollHeight;
+  }
+
   // ---------- panels ----------
   function selectPanel(panel) {
     document.querySelectorAll('#screen-app .nav-item').forEach(n => n.classList.toggle('active', n.dataset.panel === panel));
     document.querySelectorAll('#screen-app .panel').forEach(p => p.classList.remove('active'));
     const el = document.getElementById('p-' + panel);
     if (el) el.classList.add('active');
+    if (panel === 'metrics') startMetrics(); else stopMetrics();
   }
   document.addEventListener('click', e => {
     const item = e.target.closest('#screen-app .nav-item');
@@ -523,17 +799,41 @@
   });
 
   // ---------- create ----------
-  function openCreate() { $('#c-error').textContent = ''; $('#create-modal').style.display = 'flex'; $('#c-name').focus(); }
+  function renderSizes() {
+    $('#c-sizes').innerHTML = SIZES.map(s =>
+      `<div class="source${s.id === selectedSize ? ' sel' : ''}" onclick="pickSize('${s.id}')">
+        <div class="s-name">${esc(s.name)}</div><div class="s-spec">${esc(s.spec)}</div>
+      </div>`).join('');
+  }
+  function pickSize(id) { selectedSize = id; renderSizes(); }
+  function openCreate() {
+    $('#c-error').textContent = '';
+    selectedSize = 'free'; renderSizes();
+    $('#create-modal').style.display = 'flex'; $('#c-name').focus();
+  }
   function closeCreate() { $('#create-modal').style.display = 'none'; }
+  const fileToB64 = file => new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(',')[1] || ''); // strip the data: URL prefix
+    r.onerror = rej; r.readAsDataURL(file);
+  });
   async function submitCreate(ev) {
     ev.preventDefault();
-    const r = await fetch('/api/apps', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: $('#c-name').value, source: $('#c-source').value, token: $('#c-token').value })
-    });
+    const name = $('#c-name').value, source = $('#c-source').value.trim();
+    const zipFile = $('#c-zip').files[0];
+    if (!zipFile && !source) { $('#c-error').textContent = 'Enter a Git URL / folder path, or choose a .zip.'; return; }
+    const payload = { name, size: selectedSize };
+    if (zipFile) {
+      if (zipFile.size > 50 * 1024 * 1024) { $('#c-error').textContent = 'Zip too large (max 50 MB).'; return; }
+      $('#c-error').textContent = 'Uploading…';
+      payload.zip = await fileToB64(zipFile);
+    } else {
+      payload.source = source; payload.token = $('#c-token').value;
+    }
+    const r = await fetch('/api/apps', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const a = await r.json();
     if (a.error) { $('#c-error').textContent = a.error; return; }
-    $('#c-name').value = ''; $('#c-source').value = ''; $('#c-token').value = '';
+    $('#c-name').value = ''; $('#c-source').value = ''; $('#c-token').value = ''; $('#c-zip').value = '';
     closeCreate();
     await showApp(a.name);
     selectPanel('logstream'); // watch it build & start
