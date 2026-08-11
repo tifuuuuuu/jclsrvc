@@ -34,6 +34,17 @@ const SSL = (process.env.SSL_CERT && process.env.SSL_KEY)   // optional HTTPS �
   ? { cert: fs.readFileSync(process.env.SSL_CERT), key: fs.readFileSync(process.env.SSL_KEY) } : null;
 const PROTO = SSL ? 'https' : 'http';
 
+// ---- feature config (all fit the zero-dep, single-user, home-server design) ----
+const SESS_FILE = path.join(LOG_DIR, 'sessions.json');   // persisted logins (survive a server restart)
+const TOKENS_FILE = path.join(LOG_DIR, 'tokens.json');   // API bearer token -> owner email
+const METRICS_FILE = path.join(LOG_DIR, 'metrics.json'); // persisted host + per-app metric history
+const SECRET_FILE = path.join(LOG_DIR, '.secret');       // 32-byte key for env-var-at-rest encryption
+const APP_METRIC_HISTORY = 240;                          // per-app samples kept (~1h at 15s)
+const HEALTH_TIMEOUT = 30_000;                           // zero-downtime: max wait for a new version to go healthy
+// App Service plans -> a real memory ceiling (MB). Node also gets --max-old-space-size; any runtime is RSS-capped.
+const PLANS = { free: 512, basic: 1024, standard: 2048, premium: 4096 };
+const planMem = size => PLANS[String(size || 'free').toLowerCase()] || PLANS.free;
+
 // Parse one .env line -> [key, value] or null (blank/comment/invalid). Strips surrounding quotes.
 const parseEnvLine = line => {
   const m = String(line).match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
@@ -104,6 +115,88 @@ function appendLogFile(name, text) {
 
 const find = name => apps.find(a => a.name === name);
 const save = () => fs.writeFileSync(STATE_FILE, JSON.stringify(apps, null, 2));
+
+// ---- persistence for sessions / API tokens / metric history (all survive a restart) ----
+const appMetrics = new Map();  // name -> [{ ts, rss, cpu }] per-app history
+const memViol = new Map();     // name -> consecutive over-plan-cap samples (soft memory ceiling)
+let tokens = {};               // API bearer token -> owner email
+const loadJSON = (f, fallback) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (_) { return fallback; } };
+const saveSessions = () => { try { fs.writeFileSync(SESS_FILE, JSON.stringify([...sessions])); } catch (_) {} };
+const saveTokens = () => { try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens)); } catch (_) {} };
+const saveMetrics = () => { try { fs.writeFileSync(METRICS_FILE, JSON.stringify({ host: metricHistory, apps: [...appMetrics] })); } catch (_) {} };
+
+// ---- env vars encrypted at rest (AES-256-GCM) ----
+// Key: JC_SECRET if set, else a generated key persisted in logs/.secret. Stored blobs are "enc:<iv>:<tag>:<ct>"
+// (all base64). decVal passes plaintext through, so legacy unencrypted envs keep working and a bad blob never throws.
+let _encKey = null;
+function encKey() {
+  if (_encKey) return _encKey;
+  if (process.env.JC_SECRET) return _encKey = crypto.createHash('sha256').update(process.env.JC_SECRET).digest();
+  try { const k = fs.readFileSync(SECRET_FILE); if (k.length === 32) return _encKey = k; } catch (_) {}
+  _encKey = crypto.randomBytes(32);
+  try { fs.mkdirSync(LOG_DIR, { recursive: true }); fs.writeFileSync(SECRET_FILE, _encKey, { mode: 0o600 }); } catch (_) {}
+  return _encKey;
+}
+const encVal = v => {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', encKey(), iv);
+  const ct = Buffer.concat([c.update(String(v), 'utf8'), c.final()]);
+  return `enc:${iv.toString('base64')}:${c.getAuthTag().toString('base64')}:${ct.toString('base64')}`;
+};
+const decVal = v => {
+  const s = String(v);
+  if (!s.startsWith('enc:')) return v; // plaintext (legacy) -> pass through
+  try {
+    const [, iv, tag, ct] = s.split(':');
+    const d = crypto.createDecipheriv('aes-256-gcm', encKey(), Buffer.from(iv, 'base64'));
+    d.setAuthTag(Buffer.from(tag, 'base64'));
+    return d.update(Buffer.from(ct, 'base64'), undefined, 'utf8') + d.final('utf8');
+  } catch (_) { return v; } // never crash on a bad/foreign blob
+};
+const encEnv = e => Object.fromEntries(Object.entries(e || {}).map(([k, v]) => [k, encVal(v)]));
+const decEnv = e => Object.fromEntries(Object.entries(e || {}).map(([k, v]) => [k, decVal(v)]));
+// App object for API responses: env decrypted for display, everything else untouched.
+const publicApp = a => ({ ...a, env: decEnv(a.env) });
+
+// ---- health probes (used by zero-downtime cutover + the periodic health check) ----
+function tcpOk(port, timeout = 2500) {
+  return new Promise(r => {
+    const s = net.connect(port, '127.0.0.1'); let d = false;
+    const done = v => { if (d) return; d = true; try { s.destroy(); } catch (_) {} r(v); };
+    s.once('connect', () => done(true)); s.once('error', () => done(false)); s.setTimeout(timeout, () => done(false));
+  });
+}
+function httpOk(port, pathname, timeout = 3000) {
+  return new Promise(r => {
+    const req = http.request({ host: '127.0.0.1', port, path: pathname || '/', method: 'GET', timeout }, res => { res.resume(); r(res.statusCode < 500); });
+    req.on('error', () => r(false)); req.on('timeout', () => { req.destroy(); r(false); }); req.end();
+  });
+}
+// Poll until the app answers on `port` (HTTP path if set, else TCP), or give up. Bails early if the child dies.
+async function waitHealthy(port, healthPath, child, ms = HEALTH_TIMEOUT) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (child && child.exitCode !== null) return false;
+    if (await (healthPath ? httpOk(port, healthPath) : tcpOk(port))) return true;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return false;
+}
+
+// ---- docker runtime helpers ----
+const dockerImage = name => `jc-${slugify(name)}`;
+const dockerName = (name, port) => `jc-${slugify(name)}-${port}`;
+const dockerRm = container => { if (container) try { spawn('docker', ['rm', '-f', container], { stdio: 'ignore' }); } catch (_) {} };
+
+// A deploy step failed. If an old version is still serving (graceful redeploy), keep it live; else mark failed.
+function failDeploy(app) {
+  if (procs.get(app.name)) {
+    pushLog(app.name, 'Deploy failed — keeping the current version live.');
+    app.status = 'running'; broadcast(app.name, 'status', 'running'); save(); // restore label without a "went live" email
+    return;
+  }
+  setStatus(app.name, 'failed');
+}
 
 function broadcast(name, event, data) {
   const set = clients.get(name);
@@ -197,11 +290,11 @@ function run(name, cmd, args, cwd, shell, env) {
   });
 }
 
-// Read the `web:` process from a Heroku-style Procfile, if present. The escape hatch for
-// anything we don't auto-detect (Ruby, Go, custom start commands): `web: <shell command>`.
-function procfileWeb(cwd) {
+// Read a `<key>:` process line from a Heroku-style Procfile, if present. `web:` is the start-command
+// escape hatch for anything we don't auto-detect (Ruby, Go, …); `release:` is a one-off pre-start command.
+function procfileEntry(cwd, key) {
   try {
-    const m = fs.readFileSync(path.join(cwd, 'Procfile'), 'utf8').match(/^\s*web\s*:\s*(.+?)\s*$/mi);
+    const m = fs.readFileSync(path.join(cwd, 'Procfile'), 'utf8').match(new RegExp(`^\\s*${key}\\s*:\\s*(.+?)\\s*$`, 'mi'));
     return m ? m[1] : null;
   } catch (_) { return null; }
 }
@@ -217,7 +310,9 @@ function detectRuntime(cwd) {
   const hasExt = re => files.some(f => re.test(f));
 
   let rt = null;
-  if (has('package.json'))
+  if (has('Dockerfile'))
+    rt = { name: 'Docker', install: null, start: null, docker: true }; // build + run the image; own isolation
+  else if (has('package.json'))
     rt = { name: 'Node', install: 'npm install', start: 'npm start' };
   else if (has('requirements.txt') || has('pyproject.toml') || has('app.py') || has('main.py'))
     rt = { name: 'Python',
@@ -226,8 +321,9 @@ function detectRuntime(cwd) {
   else if (hasExt(/\.(sln|slnx|csproj|fsproj)$/i))
     rt = { name: '.NET', install: 'dotnet restore', start: 'dotnet run' };
 
-  const web = procfileWeb(cwd);
-  if (web) rt = { name: rt ? rt.name : 'Procfile', install: rt ? rt.install : null, start: web };
+  const web = procfileEntry(cwd, 'web');
+  if (web && !(rt && rt.docker)) rt = { name: rt ? rt.name : 'Procfile', install: rt ? rt.install : null, start: web };
+  if (rt) rt.release = procfileEntry(cwd, 'release'); // optional one-off pre-start command (migrations, asset build…)
   return rt;
 }
 
@@ -240,14 +336,14 @@ async function deploy(app, token, checkout) {
   if (app.uploaded) {
     // Zip-uploaded app: code already lives in workspaces/<name>; nothing to clone.
     cwd = path.join(WORKSPACES, app.name);
-    if (!fs.existsSync(cwd)) { pushLog(app.name, `Upload missing for ${app.name}`); return setStatus(app.name, 'failed'); }
+    if (!fs.existsSync(cwd)) { pushLog(app.name, `Upload missing for ${app.name}`); return failDeploy(app); }
   } else if (app.managed) {
     cwd = path.join(WORKSPACES, app.name);
     if (!fs.existsSync(cwd)) {
       fs.mkdirSync(WORKSPACES, { recursive: true });
       pushLog(app.name, `$ git clone ${app.source}`); // clean URL — never log the token
       if (!await run(app.name, 'git', ['clone', authUrl(app.source, token), cwd], ROOT, false, gitEnv()))
-        return setStatus(app.name, 'failed');
+        return failDeploy(app);
     } else {
       pushLog(app.name, `$ git pull`); // token persisted in the clone's .git/config from the first clone
       await run(app.name, 'git', ['pull'], cwd, false, gitEnv());
@@ -255,13 +351,13 @@ async function deploy(app, token, checkout) {
     if (checkout) { // rollback: pin to a past commit
       pushLog(app.name, `$ git checkout ${checkout}`);
       if (!await run(app.name, 'git', ['checkout', checkout], cwd, false, gitEnv()))
-        return setStatus(app.name, 'failed');
+        return failDeploy(app);
     }
     const commit = await gitHead(cwd); // record what we deployed (for history + rollback)
     if (commit) { pushLog(app.name, `Deployed commit ${commit}`); recordDeploy(app, commit); }
   } else {
     cwd = app.source;
-    if (!fs.existsSync(cwd)) { pushLog(app.name, `Path not found: ${cwd}`); return setStatus(app.name, 'failed'); }
+    if (!fs.existsSync(cwd)) { pushLog(app.name, `Path not found: ${cwd}`); return failDeploy(app); }
   }
   app.cwd = cwd;
 
@@ -270,41 +366,88 @@ async function deploy(app, token, checkout) {
   const rt = detectRuntime(cwd);
   if (!rt) {
     pushLog(app.name, `Couldn't detect a runtime. Supported: Node (package.json), Python (requirements.txt/app.py), .NET (.sln/.csproj), or any repo with a Procfile ("web: <command>").`);
-    return setStatus(app.name, 'failed');
+    return failDeploy(app);
   }
   app.runtime = rt.name;
   pushLog(app.name, `Detected ${rt.name} app`);
 
-  if (rt.install) {
+  if (rt.docker) {
+    pushLog(app.name, `$ docker build -t ${dockerImage(app.name)} .`);
+    if (!await run(app.name, 'docker', ['build', '-t', dockerImage(app.name), '.'], cwd, false))
+      return failDeploy(app);
+  } else if (rt.install) {
     pushLog(app.name, `$ ${rt.install}`);
     if (!await run(app.name, rt.install, [], cwd, true)) // shell:true — Windows needs it for npm.cmd etc.
-      return setStatus(app.name, 'failed');
+      return failDeploy(app);
   }
 
-  startApp(app);
+  if (rt.release) { // Procfile release: one-off command run after install, before start (migrations, asset build…)
+    pushLog(app.name, `$ ${rt.release}`);
+    if (!await run(app.name, rt.release, [], cwd, true)) return failDeploy(app);
+  }
+
+  startApp(app, { graceful: true });
 }
 
-async function startApp(app) {
-  app.desired = 'running'; // starting expresses intent to run → drives auto-restart + boot auto-start
+// Start (or, when graceful and already running, hot-swap) the app's process.
+// Graceful zero-downtime path: bring the new version up on a fresh port, health-check it, then cut traffic
+// over and retire the old process. If the new version never goes healthy, the old one is left serving.
+async function startApp(app, { graceful = false } = {}) {
+  app.desired = 'running'; // expresses intent to run → drives auto-restart + boot auto-start
   const rt = detectRuntime(app.cwd);
-  if (!rt) { pushLog(app.name, `No runtime detected in ${app.cwd} — redeploy needed.`); return setStatus(app.name, 'failed'); }
-  const used = new Set(apps.map(a => a.port).filter(p => p && p !== app.port));
-  const port = app.port || await findFreePort(PORT_BASE, used);
-  pushLog(app.name, `$ PORT=${port} ${rt.start}`);
-  const child = spawn(rt.start, {
-    cwd: app.cwd, shell: true,
-    // User env first, then platform vars win: PORT is the cross-runtime convention; ASPNETCORE_URLS makes Kestrel (.NET) bind it too.
-    env: { ...process.env, ...(app.env || {}), PORT: String(port), WEBSITE_PORT: String(port), ASPNETCORE_URLS: `http://localhost:${port}` }
-  });
-  procs.set(app.name, child);
-  app.pid = child.pid;
-  app.port = port;
-  app.startedAt = new Date().toISOString();
-  app.url = `${PROTO}://${app.name}.localhost:${PORT}`; // pretty URL via the reverse proxy below
-  setStatus(app.name, 'running');
+  if (!rt) { pushLog(app.name, `No runtime detected in ${app.cwd} — redeploy needed.`); return failDeploy(app); }
+
+  const oldChild = procs.get(app.name), oldContainer = app.container;
+  // Swap in only when a live old process is actually serving (its status may read "building" mid-redeploy).
+  const swap = graceful && oldChild && oldChild.exitCode === null;
+  const used = new Set(apps.map(a => a.port).filter(p => p && (swap || p !== app.port)));
+  const port = swap ? await findFreePort(PORT_BASE, used) : (app.port || await findFreePort(PORT_BASE, used));
+  const cap = planMem(app.size);
+  const env = { ...process.env, ...decEnv(app.env), PORT: String(port), WEBSITE_PORT: String(port),
+    ASPNETCORE_URLS: `http://localhost:${port}`,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --max-old-space-size=${cap}`.trim() }; // Node self-limits to the plan
+
+  let child, container = null;
+  if (rt.docker) {
+    container = dockerName(app.name, port);
+    dockerRm(container); // clear any stale container with this name
+    const args = ['run', '--rm', '--name', container, '-e', `PORT=${port}`, `--memory=${cap}m`,
+      '-p', `127.0.0.1:${port}:${port}`,
+      ...Object.entries(decEnv(app.env)).flatMap(([k, v]) => ['-e', `${k}=${v}`]), dockerImage(app.name)];
+    pushLog(app.name, `$ docker run …:${port} ${dockerImage(app.name)}`);
+    child = spawn('docker', args, { cwd: app.cwd });
+  } else {
+    pushLog(app.name, `$ PORT=${port} ${rt.start}`);
+    child = spawn(rt.start, { cwd: app.cwd, shell: true, env });
+  }
   child.stdout.on('data', d => pushLog(app.name, d.toString()));
   child.stderr.on('data', d => pushLog(app.name, d.toString()));
+
+  if (swap) {
+    pushLog(app.name, `Starting new version on :${port} — health-checking before cutover…`);
+    if (!await waitHealthy(port, app.healthPath, child)) {
+      pushLog(app.name, 'New version failed its health check — keeping the current version live.');
+      if (rt.docker) dockerRm(container); else killTree(child.pid);
+      return; // old process/container keeps serving; status stays running
+    }
+    procs.set(app.name, child);
+    app.pid = child.pid; app.port = port; app.container = container;
+    app.startedAt = new Date().toISOString();
+    app.url = `${PROTO}://${app.name}.localhost:${PORT}`;
+    child.on('exit', code => onExit(app.name, code));
+    setStatus(app.name, 'running');
+    if (oldChild) { oldChild.removeAllListeners('exit'); killTree(oldChild.pid); } // retire old now traffic points away
+    if (oldContainer && oldContainer !== container) dockerRm(oldContainer);
+    pushLog(app.name, '✓ Cutover complete — zero-downtime deploy.');
+    return;
+  }
+
+  procs.set(app.name, child);
+  app.pid = child.pid; app.port = port; app.container = container;
+  app.startedAt = new Date().toISOString();
+  app.url = `${PROTO}://${app.name}.localhost:${PORT}`; // pretty URL via the reverse proxy below
   child.on('exit', code => onExit(app.name, code));
+  setStatus(app.name, 'running');
 }
 
 // Process died. If the user didn't stop it, auto-restart with exponential backoff — unless it's crash-looping.
@@ -331,9 +474,12 @@ function onExit(name, code) {
 function stopApp(app) {
   app.desired = 'stopped'; // explicit stop → don't auto-restart, don't auto-start on boot
   restartHist.delete(app.name);
+  const child = procs.get(app.name);
+  if (child) child.removeAllListeners('exit'); // don't let the death we're about to cause trigger auto-restart
   killTree(app.pid);
+  if (app.container) dockerRm(app.container); // stop the container too (docker run --rm leaves it otherwise)
   procs.delete(app.name);
-  app.pid = null;
+  app.pid = null; app.container = null;
   setStatus(app.name, 'stopped');
 }
 
@@ -343,15 +489,12 @@ function bootApp(app) {
   else deploy(app);
 }
 
-// TCP-probe every running app. Repeated failures on a live pid = hung app → restart it (throttled to once/min).
+// Probe every running app (HTTP health path if configured, else TCP). Repeated failures = hung app → restart (throttled to once/min).
 function healthCheck() {
   for (const a of apps) {
     if (a.status !== 'running' || !a.port) { healthFails.delete(a.name); continue; }
-    const sock = net.connect(a.port, '127.0.0.1');
-    let done = false;
-    const ok = () => { if (done) return; done = true; sock.destroy(); a.health = 'healthy'; healthFails.set(a.name, 0); };
-    const bad = () => {
-      if (done) return; done = true; sock.destroy();
+    (a.healthPath ? httpOk(a.port, a.healthPath) : tcpOk(a.port, 3000)).then(good => {
+      if (good) { a.health = 'healthy'; healthFails.set(a.name, 0); return; }
       const n = (healthFails.get(a.name) || 0) + 1; healthFails.set(a.name, n);
       a.health = 'unhealthy';
       if (n >= 3 && a.desired === 'running' && Date.now() - (lastHealthRestart.get(a.name) || 0) > 60_000) {
@@ -359,22 +502,44 @@ function healthCheck() {
         pushLog(a.name, `Health check failed ${n}× — restarting unresponsive app`);
         stopApp(a); setTimeout(() => startApp(a), 800);
       }
-    };
-    sock.once('connect', ok); sock.once('error', bad); sock.setTimeout(3000, bad);
+    });
   }
 }
 
-// Sample host metrics into a ring buffer and fire threshold alerts. Started at boot.
+// Sample host + per-app metrics into ring buffers, enforce plan memory caps, fire threshold alerts, persist. At boot.
 function startMetricSampler() {
-  const sample = () => {
+  const sample = async () => {
     const m = metrics();
     metricHistory.push({ ts: m.ts, mem: m.mem.pct, disk: m.disk ? m.disk.pct : null });
     while (metricHistory.length > METRIC_HISTORY) metricHistory.shift();
     checkAlert('memory', m.mem.pct);
     if (m.disk) checkAlert('disk', m.disk.pct);
+    await sampleApps();
+    saveMetrics();
   };
   sample();
   setInterval(sample, METRIC_INTERVAL).unref();
+}
+// Per-app RSS/CPU history + plan memory-cap enforcement (restart an app that overruns its plan for 3 samples).
+async function sampleApps() {
+  for (const a of apps) {
+    if (a.status !== 'running' || !a.pid) continue;
+    const st = await pidStat(a.pid);
+    const cpu = pidCpuPct(a.name, a.pid, st.cpuMs);
+    const hist = appMetrics.get(a.name) || [];
+    hist.push({ ts: Date.now(), rss: st.rss, cpu });
+    while (hist.length > APP_METRIC_HISTORY) hist.shift();
+    appMetrics.set(a.name, hist);
+    const capBytes = planMem(a.size) * 1024 * 1024;
+    if (st.rss && st.rss > capBytes) {
+      const n = (memViol.get(a.name) || 0) + 1; memViol.set(a.name, n);
+      if (n >= 3 && a.desired === 'running') {
+        memViol.set(a.name, 0);
+        pushLog(a.name, `Memory ${(st.rss / 1048576 | 0)} MB exceeded the ${planMem(a.size)} MB ${a.size || 'free'} plan — restarting`);
+        stopApp(a); setTimeout(() => startApp(a), 800);
+      }
+    } else memViol.set(a.name, 0);
+  }
 }
 function checkAlert(resource, pct) {
   if (pct < ALERT_PCT || Date.now() - (lastAlert[resource] || 0) < ALERT_EVERY) return;
@@ -542,7 +707,7 @@ async function handleCallback(req, res, u) {
   try {
     const user = await exchangeCode(code);
     const sid = crypto.randomBytes(16).toString('hex');
-    sessions.set(sid, user);
+    sessions.set(sid, user); saveSessions(); // persist so a server restart doesn't sign everyone out
     await recordUser(user); // first-time users -> Cosmos + R2; failures never block sign-in
     res.writeHead(302, { 'Set-Cookie': `jc_session=${sid}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800`, Location: '/' });
     res.end();
@@ -660,7 +825,7 @@ function readBody(req) {
 // *.localhost resolves to 127.0.0.1 in modern browsers with no DNS/hosts setup.
 function proxyToApp(name, req, res) {
   const app = find(name);
-  if (!app || app.status !== 'running' || !app.port) {
+  if (!app || !app.port || !procs.get(name)) { // gate on a live process, not the status label → zero-downtime rebuilds keep serving
     res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(`<h2>502 &middot; ${name}</h2><p>This app is not running on Jerrick Cloud.</p>`);
   }
@@ -694,7 +859,7 @@ const handler = async (req, res) => {
     const app = find(parts[2]);
     if (!app || !app.hookKey || u.searchParams.get('key') !== app.hookKey) return json(res, { error: 'Bad hook key' }, 403);
     pushLog(app.name, '🔔 Webhook received — redeploying');
-    stopApp(app); setTimeout(() => deploy(app), 500);
+    deploy(app); // graceful: old version keeps serving until the new one is healthy
     return json(res, { ok: true });
   }
 
@@ -704,11 +869,13 @@ const handler = async (req, res) => {
     if (u.pathname === '/auth/google') return startLogin(res);
     if (u.pathname === '/auth/callback') return handleCallback(req, res, u);
     if (u.pathname === '/auth/logout') {
-      const sid = parseCookies(req).jc_session; if (sid) sessions.delete(sid);
+      const sid = parseCookies(req).jc_session; if (sid) { sessions.delete(sid); saveSessions(); }
       res.writeHead(302, { 'Set-Cookie': 'jc_session=; HttpOnly; Path=/; Max-Age=0', Location: '/auth/login' });
       return res.end();
     }
-    req.user = currentUser(req);
+    // API bearer token (for CLI / CI) authenticates too; otherwise the session cookie.
+    const bearer = (req.headers.authorization || '').match(/^Bearer\s+(\S+)$/i);
+    req.user = (bearer && tokens[bearer[1]]) ? { email: tokens[bearer[1]] } : currentUser(req);
     if (!req.user) {
       if (parts[0] === 'api') return json(res, { error: 'Not authenticated' }, 401);
       res.writeHead(302, { Location: '/auth/login' }); return res.end(); // send the dashboard to Google
@@ -722,6 +889,17 @@ const handler = async (req, res) => {
     return json(res, AUTH_ON ? { auth: true, email: (req.user || {}).email, name: (req.user || {}).name } : { auth: false });
   }
 
+  // API bearer token: issue (POST, revokes any prior) / check (GET). Needs Google sign-in to have a stable owner.
+  if (u.pathname === '/api/token') {
+    if (!AUTH_ON) return json(res, { error: 'Enable Google sign-in (GOOGLE_CLIENT_ID/SECRET) to use API tokens' }, 400);
+    if (req.method === 'POST') {
+      for (const [t, e] of Object.entries(tokens)) if (e === req.user.email) delete tokens[t]; // one token per user
+      const t = crypto.randomBytes(24).toString('hex'); tokens[t] = req.user.email; saveTokens();
+      return json(res, { token: t });
+    }
+    if (req.method === 'GET') return json(res, { hasToken: Object.values(tokens).includes(req.user.email) });
+  }
+
   if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/index.html')) {
     return fs.readFile(path.join(ROOT, 'index.html'), (e, data) => {
       if (e) { res.writeHead(404); return res.end('index.html not found'); }
@@ -730,9 +908,9 @@ const handler = async (req, res) => {
   }
 
   if (parts[0] === 'api' && parts[1] === 'apps') {
-    // When auth is on, a user only sees/controls their own apps (plus legacy apps with no owner).
-    const mine = a => !AUTH_ON || !a.owner || (req.user && a.owner === req.user.email);
-    if (req.method === 'GET' && parts.length === 2) return json(res, apps.filter(mine));
+    // When auth is on, a user sees/controls their own apps, apps shared with them, and legacy apps with no owner.
+    const mine = a => !AUTH_ON || !a.owner || (req.user && (a.owner === req.user.email || (a.collaborators || []).includes(req.user.email)));
+    if (req.method === 'GET' && parts.length === 2) return json(res, apps.filter(mine).map(publicApp));
 
     if (req.method === 'POST' && parts.length === 2) {
       const body = await readBody(req);
@@ -746,7 +924,7 @@ const handler = async (req, res) => {
 
       // Fields shared by every new app. hookKey authenticates the git-push webhook; desired drives auto-restart/boot.
       const base = { name, size, port: null, pid: null, status: 'queued', url: null, env: {}, desired: 'running',
-        hookKey: crypto.randomBytes(12).toString('hex'), domains: [], deploys: [],
+        hookKey: crypto.randomBytes(12).toString('hex'), domains: [], deploys: [], collaborators: [],
         owner: req.user ? req.user.email : undefined, createdAt: new Date().toISOString() };
 
       if (zipB64) { // zip upload → extract into workspaces/, deploy in place
@@ -778,21 +956,51 @@ const handler = async (req, res) => {
     const app = find(parts[2]);
     if (!app || !mine(app)) return json(res, { error: 'Not found' }, 404); // owned by someone else → 404, not 403
 
-    if (req.method === 'GET' && parts.length === 3) return json(res, app);
+    if (req.method === 'GET' && parts.length === 3) return json(res, publicApp(app));
 
     if (req.method === 'GET' && parts[3] === 'stats' && parts.length === 4) {
       const st = await pidStat(app.pid);
       const cpu = pidCpuPct(app.name, app.pid, st.cpuMs);
       const uptimeSec = app.startedAt && app.status === 'running' ? Math.round((Date.now() - new Date(app.startedAt)) / 1000) : 0;
-      return json(res, { status: app.status, health: app.health || 'unknown', rss: st.rss, cpu, uptimeSec, restarts: app.restarts || 0 });
+      return json(res, { status: app.status, health: app.health || 'unknown', rss: st.rss, cpu, uptimeSec, restarts: app.restarts || 0, memMb: planMem(app.size) });
     }
 
     if (req.method === 'PUT' && parts[3] === 'env' && parts.length === 4) {
       const body = await readBody(req);
       const env = {}; // keep only valid shell identifiers; stringify values
       for (const [k, v] of Object.entries(body.env || {})) if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) env[k] = String(v);
-      app.env = env; save();
-      return json(res, { ok: true, env }); // takes effect on next start/restart
+      app.env = encEnv(env); save(); // encrypted at rest
+      return json(res, { ok: true, env }); // takes effect on next start/restart (plaintext back for display)
+    }
+
+    if (req.method === 'POST' && parts[3] === 'scale' && parts.length === 4) {
+      const body = await readBody(req);
+      const size = String(body.size || '').toLowerCase();
+      if (!PLANS[size]) return json(res, { error: 'Unknown plan' }, 400);
+      app.size = size; save();
+      return json(res, { ok: true, size, memMb: planMem(size) }); // applies on next start/restart
+    }
+
+    if (req.method === 'PUT' && parts[3] === 'health' && parts.length === 4) {
+      const body = await readBody(req);
+      let p = String(body.path || '').trim();
+      if (p && !p.startsWith('/')) p = '/' + p;
+      app.healthPath = p || undefined; save();
+      return json(res, { ok: true, healthPath: app.healthPath || '' });
+    }
+
+    if (req.method === 'POST' && parts[3] === 'collaborators' && parts.length === 4) {
+      if (AUTH_ON && app.owner && req.user.email !== app.owner) return json(res, { error: 'Only the owner can share this app' }, 403);
+      const body = await readBody(req);
+      const email = String(body.email || '').trim().toLowerCase();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return json(res, { error: 'Enter a valid email' }, 400);
+      app.collaborators = [...new Set([...(app.collaborators || []), email])]; save();
+      return json(res, publicApp(app));
+    }
+    if (req.method === 'DELETE' && parts[3] === 'collaborators' && parts.length === 5) {
+      if (AUTH_ON && app.owner && req.user.email !== app.owner) return json(res, { error: 'Only the owner can share this app' }, 403);
+      app.collaborators = (app.collaborators || []).filter(e => e !== decodeURIComponent(parts[4]).toLowerCase()); save();
+      return json(res, publicApp(app));
     }
 
     if (req.method === 'POST' && parts[3] === 'domains' && parts.length === 4) {
@@ -801,11 +1009,11 @@ const handler = async (req, res) => {
       if (!/^[a-z0-9.-]+\.[a-z0-9.-]+$/.test(d)) return json(res, { error: 'Enter a valid hostname, e.g. app.example.com' }, 400);
       if (apps.some(a => a !== app && (a.domains || []).includes(d))) return json(res, { error: 'Domain already mapped to another app' }, 409);
       app.domains = [...new Set([...(app.domains || []), d])]; save();
-      return json(res, app);
+      return json(res, publicApp(app));
     }
     if (req.method === 'DELETE' && parts[3] === 'domains' && parts.length === 5) {
       app.domains = (app.domains || []).filter(d => d !== decodeURIComponent(parts[4])); save();
-      return json(res, app);
+      return json(res, publicApp(app));
     }
 
     if (req.method === 'GET' && parts[3] === 'logs' && parts[4] === 'download') {
@@ -827,19 +1035,20 @@ const handler = async (req, res) => {
 
     if (req.method === 'POST' && parts[3]) {
       const action = parts[3];
+      // restart/redeploy/rollback are graceful: the running version keeps serving until the new one is healthy.
       if (action === 'stop') stopApp(app);
       else if (action === 'start') startApp(app);
-      else if (action === 'restart') { stopApp(app); setTimeout(() => startApp(app), 800); }
-      else if (action === 'redeploy') { stopApp(app); setTimeout(() => deploy(app), 800); }
+      else if (action === 'restart') startApp(app, { graceful: true });
+      else if (action === 'redeploy') deploy(app);
       else if (action === 'rollback') {
         if (!app.managed) return json(res, { error: 'Rollback is available for Git apps only' }, 400);
         const body = await readBody(req);
         const commit = String(body.commit || '').trim();
         if (!/^[0-9a-f]{7,40}$/i.test(commit)) return json(res, { error: 'A commit hash is required' }, 400);
-        stopApp(app); setTimeout(() => deploy(app, null, commit), 500);
+        deploy(app, null, commit);
       }
       else return json(res, { error: 'Unknown action' }, 400);
-      return json(res, app);
+      return json(res, publicApp(app));
     }
 
     if (req.method === 'DELETE' && parts.length === 3) {
@@ -850,7 +1059,7 @@ const handler = async (req, res) => {
       }
       try { fs.rmSync(logFile(app.name), { force: true }); } catch (_) {}
       apps = apps.filter(a => a.name !== app.name); save();
-      logbuf.delete(app.name); clients.delete(app.name);
+      logbuf.delete(app.name); clients.delete(app.name); appMetrics.delete(app.name); memViol.delete(app.name);
       return json(res, { ok: true });
     }
   }
@@ -864,7 +1073,7 @@ const server = SSL ? https.createServer(SSL, handler) : http.createServer(handle
 server.on('upgrade', (req, socket, head) => {
   const name = hostToApp((req.headers.host || '').split(':')[0]);
   const app = name && find(name);
-  if (!app || app.status !== 'running' || !app.port) return socket.destroy();
+  if (!app || !app.port || !procs.get(name)) return socket.destroy();
   const up = net.connect(app.port, '127.0.0.1', () => {
     up.write(`${req.method} ${req.url} HTTP/1.1\r\n` +
       Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n');
@@ -929,19 +1138,43 @@ if (process.argv.includes('--check')) {
   assert.equal(backoff(1), 1000); assert.equal(backoff(3), 4000); assert.equal(backoff(10), 30_000);
   // env var key filter: keep valid shell identifiers only.
   assert.ok(/^[A-Za-z_][A-Za-z0-9_]*$/.test('MY_KEY') && !/^[A-Za-z_][A-Za-z0-9_]*$/.test('1BAD'));
+  // Plan -> memory cap (MB); unknown/blank falls back to free.
+  assert.equal(planMem('premium'), 4096); assert.equal(planMem('nope'), PLANS.free); assert.equal(planMem(), PLANS.free);
+  // Env-at-rest: encrypt roundtrips, plaintext (legacy) passes through, a bad blob never throws.
+  const _blob = encVal('s3cr3t!'); assert.ok(_blob.startsWith('enc:')); assert.equal(decVal(_blob), 's3cr3t!');
+  assert.equal(decVal('plain'), 'plain'); assert.doesNotThrow(() => decVal('enc:not:real:blob'));
+  assert.deepEqual(decEnv(encEnv({ A: '1', B: 'two words' })), { A: '1', B: 'two words' });
+  // publicApp decrypts env for display and leaves other fields intact.
+  const _pa = publicApp({ name: 'x', size: 'basic', env: encEnv({ K: 'v' }) });
+  assert.equal(_pa.env.K, 'v'); assert.equal(_pa.size, 'basic');
+  // Docker image/container naming: slug-safe and stable.
+  assert.equal(dockerImage('My App'), 'jc-my-app'); assert.equal(dockerName('My App', 3005), 'jc-my-app-3005');
+  // Collaborator email guard: accept a real address, reject junk.
+  const emailOk = e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e);
+  assert.ok(emailOk('a@b.com') && !emailOk('nope'));
   findFreePort(PORT_BASE, new Set()).then(p => { assert.ok(p >= PORT_BASE); console.log('self-check OK'); process.exit(0); });
 } else {
   fs.mkdirSync(LOG_DIR, { recursive: true });
+  // Restore persisted logins, API tokens, and metric history so a restart is seamless.
+  for (const [sid, u] of loadJSON(SESS_FILE, [])) sessions.set(sid, u);
+  tokens = loadJSON(TOKENS_FILE, {});
+  const savedMetrics = loadJSON(METRICS_FILE, null);
+  if (savedMetrics) {
+    if (Array.isArray(savedMetrics.host)) metricHistory.push(...savedMetrics.host.slice(-METRIC_HISTORY));
+    for (const [k, v] of savedMetrics.apps || []) appMetrics.set(k, v);
+  }
   // Clean up orphaned children from a previous run; migrate old records; mark desired-running apps for boot.
   for (const a of apps) {
     if (a.pid) killTree(a.pid);
-    a.pid = null;
+    if (a.container) dockerRm(a.container); // stop a container left running by a previous process
+    a.pid = null; a.container = null;
     a.health = 'unknown';
     if (a.desired === undefined) a.desired = a.status === 'running' ? 'running' : 'stopped'; // migrate pre-desired records
     if (!a.hookKey) a.hookKey = crypto.randomBytes(12).toString('hex'); // backfill webhooks/env/domains onto legacy apps
     if (!a.env) a.env = {};
     if (!a.domains) a.domains = [];
     if (!a.deploys) a.deploys = [];
+    if (!a.collaborators) a.collaborators = [];
     a.status = a.desired === 'running' ? 'queued' : 'stopped';
   }
   save();
