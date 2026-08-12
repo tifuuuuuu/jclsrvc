@@ -312,6 +312,8 @@
       <div class="nav-group">Monitoring</div>
       <div class="nav-item" data-panel="metrics"><svg viewBox="0 0 24 24"><path d="M4 20V10h4v10zm6 0V4h4v16zm6 0v-7h4v7z"/></svg>Metrics</div>
       <div class="nav-item" data-panel="logstream"><svg viewBox="0 0 24 24"><path d="M4 5h16v3H4zm0 5h16v3H4zm0 5h10v3H4z"/></svg>Log stream</div>
+      <div class="nav-group">Development tools</div>
+      <div class="nav-item" data-panel="shell"><svg viewBox="0 0 24 24"><path d="M3 3h18v18H3zm2 4v12h14V7zm2 2 3 3-3 3v-2l1-1-1-1zm5 4h4v2h-4z"/></svg>Console (SSH)</div>
     </nav>
 
     <main class="content">
@@ -484,6 +486,19 @@
         <h2 class="blade-h">Log stream</h2>
         <p class="desc">Live build and runtime output, streamed from the server.</p>
         <div class="console" id="console"></div>
+      </section>
+
+      <!-- Console (one-shot exec in the app's working dir) -->
+      <section class="panel" id="p-shell">
+        <h2 class="blade-h">Console</h2>
+        <p class="desc">Run commands inside your app's directory — like an SSH session. Each command runs on its own (<span class="mono">cd</span> doesn't persist), 15s max.</p>
+        <div class="console" id="shell-out"></div>
+        <form onsubmit="runExec(event)" style="display:flex;gap:8px;margin-top:10px">
+          <span class="mono" style="align-self:center;color:var(--muted)">$</span>
+          <input id="shell-input" class="mono" autocomplete="off" spellcheck="false" placeholder="ls -la"
+                 style="flex:1;padding:9px 12px;border-radius:9px;border:1px solid var(--border-2);background:var(--surface-2);color:var(--text)">
+          <button class="btn primary" type="submit">Run</button>
+        </form>
       </section>
     </main>
   </div>
@@ -846,6 +861,29 @@
     if (atBottom) c.scrollTop = c.scrollHeight;
   }
 
+  // ---------- console (one-shot exec) ----------
+  const shellPrint = (text, cls) => {
+    const out = $('#shell-out');
+    const div = document.createElement('div');
+    div.textContent = text;
+    if (cls) div.style.color = cls;
+    out.appendChild(div);
+    out.scrollTop = out.scrollHeight;
+  };
+  async function runExec(e) {
+    e.preventDefault();
+    const inp = $('#shell-input'), cmd = inp.value.trim();
+    if (!cmd || !currentName) return;
+    shellPrint('$ ' + cmd, 'var(--accent)');
+    inp.value = ''; inp.disabled = true;
+    try {
+      const r = await api(`/${currentName}/exec`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd }) });
+      if (r.error) shellPrint(r.error, '#ff8080');
+      else if (r.out) shellPrint(r.out.replace(/\n$/, ''));
+    } catch (_) { shellPrint('Request failed', '#ff8080'); }
+    inp.disabled = false; inp.focus();
+  }
+
   // ---------- metrics (host memory + disk, polled while the Metrics panel is open) ----------
   let metricsTimer = null, memHist = [], diskHist = [];
   function stopMetrics() { if (metricsTimer) { clearInterval(metricsTimer); metricsTimer = null; } }
@@ -904,6 +942,7 @@
     const el = document.getElementById('p-' + panel);
     if (el) el.classList.add('active');
     if (panel === 'metrics') startMetrics(); else stopMetrics();
+    if (panel === 'shell') $('#shell-input').focus();
   }
   document.addEventListener('click', e => {
     const item = e.target.closest('#screen-app .nav-item');

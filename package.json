@@ -3,8 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "description": "Jerrick Cloud - deploy a web app and get a live URL. Web apps only for now.",
+  "bin": { "jc": "jc.js" },
   "scripts": {
     "start": "node server.js",
-    "check": "node server.js --check"
+    "check": "node server.js --check && node jc.js --check"
+  },
+  "dependencies": {
+    "mongodb": "^6.12.0"
   }
 }

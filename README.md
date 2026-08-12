@@ -46,7 +46,7 @@ node server.js --check    # run the self-checks
 | `ALERT_PCT` | Memory/disk alert threshold percent (default 85). |
 | `SSL_CERT` / `SSL_KEY` | Paths to a cert/key pair → serve over HTTPS. |
 | `JC_SECRET` | Key for env-var-at-rest encryption. Unset → a random key is generated and stored in `logs/.secret`. |
-| `R2_*` / `COSMOS_*` | First-login user persistence (Cloudflare R2 + Azure Cosmos). |
+| `MONGODB_URI` | First-login user persistence (MongoDB — a connection string; db name optional in the URI). |
 
 ## Reaching it from other devices
 

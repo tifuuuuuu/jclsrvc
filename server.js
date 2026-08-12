@@ -708,95 +708,42 @@ async function handleCallback(req, res, u) {
     const user = await exchangeCode(code);
     const sid = crypto.randomBytes(16).toString('hex');
     sessions.set(sid, user); saveSessions(); // persist so a server restart doesn't sign everyone out
-    await recordUser(user); // first-time users -> Cosmos + R2; failures never block sign-in
+    await recordUser(user); // first-time users -> MongoDB; failures never block sign-in
     res.writeHead(302, { 'Set-Cookie': `jc_session=${sid}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800`, Location: '/' });
     res.end();
   } catch (e) { res.writeHead(500); res.end('Sign-in failed: ' + e.message); }
 }
 
-// ---- first-time user persistence: R2 (existence gate) + Cosmos DB (record) ----
-// On login: HEAD the gmail in R2 -> exists ? returning user, go home.
-//                                -> missing ? upsert full details to Cosmos, then mark the gmail in R2.
-// R2 is the cheap existence check; Cosmos holds the record. Both no-op unless configured, so the
-// platform still runs open on localhost. Configure via env (unset -> whole feature is a no-op):
-//   R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET     (Cloudflare R2, S3 API)
-//   COSMOS_CONN (AccountEndpoint=...;AccountKey=...;) / COSMOS_DB / COSMOS_CONTAINER   (Azure Cosmos, SQL API)
-//   The Cosmos container must be partitioned on /email.
-// ponytail: naive one-object-per-user marker, HEAD-based existence, no retry/pagination. Enough for a
-//   single-tenant tool; a Cosmos point-read could replace R2 if you'd rather run one store.
-const sha256hex = s => crypto.createHash('sha256').update(String(s), 'utf8').digest('hex');
-const hmac = (key, msg) => crypto.createHmac('sha256', key).update(msg, 'utf8').digest();
-// AccountEndpoint=https://x.documents.azure.com:443/;AccountKey=BASE64==; -> { endpoint, key }
-const parseCosmosConn = cs => ({
-  endpoint: (String(cs).match(/AccountEndpoint=([^;]+)/) || [])[1] || '',
-  key: (String(cs).match(/AccountKey=([^;]+)/) || [])[1] || '',
-});
-const COSMOS = parseCosmosConn(process.env.COSMOS_CONN || '');
-const R2_ON = !!(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY && process.env.R2_BUCKET);
-const COSMOS_ON = !!(COSMOS.endpoint && (COSMOS.key || process.env.COSMOS_KEY) && process.env.COSMOS_DB && process.env.COSMOS_CONTAINER);
-
-// One S3-compatible (SigV4) request to R2. Object key is a sha256 hex of the email -> always URL-safe.
-function r2Request(method, key, body = '') {
-  return new Promise((resolve, reject) => {
-    const host = `${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-    const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, ''); // YYYYMMDDTHHMMSSZ
-    const dateStamp = amzDate.slice(0, 8);
-    const payloadHash = sha256hex(body);
-    const uri = `/${process.env.R2_BUCKET}/${key}`;
-    const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
-    const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
-    const canonicalReq = [method, uri, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
-    const scope = `${dateStamp}/auto/s3/aws4_request`; // R2 region is always "auto"
-    const toSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256hex(canonicalReq)].join('\n');
-    let k = hmac('AWS4' + process.env.R2_SECRET_ACCESS_KEY, dateStamp);
-    k = hmac(k, 'auto'); k = hmac(k, 's3'); k = hmac(k, 'aws4_request');
-    const signature = crypto.createHmac('sha256', k).update(toSign, 'utf8').digest('hex');
-    const headers = {
-      Authorization: `AWS4-HMAC-SHA256 Credential=${process.env.R2_ACCESS_KEY_ID}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
-      'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate,
-    };
-    if (body) headers['Content-Length'] = Buffer.byteLength(body);
-    const req = https.request({ host, method, path: uri, headers }, resp => {
-      let b = ''; resp.on('data', c => b += c); resp.on('end', () => resolve({ status: resp.statusCode, body: b }));
-    });
-    req.on('error', reject); if (body) req.write(body); req.end();
-  });
-}
-const r2Key = email => `users/${sha256hex(String(email).toLowerCase())}`;
-async function r2Exists(email) { return (await r2Request('HEAD', r2Key(email))).status === 200; }
-async function r2Mark(email) {
-  const r = await r2Request('PUT', r2Key(email), String(email).toLowerCase());
-  if (r.status >= 300) throw new Error(`R2 PUT ${r.status}: ${r.body}`);
+// ---- first-time user persistence: MongoDB ----
+// On login, upsert the user by email. $setOnInsert => the first login captures name+createdAt;
+// returning logins match the same _id and change nothing (upsert is idempotent, so no existence gate
+// is needed). No-op unless MONGODB_URI is set, so the platform still runs open on localhost.
+// Configure via one env var:
+//   MONGODB_URI   e.g. mongodb+srv://user:pass@cluster.mongodb.net/jerrickcloud
+// The db name comes from the connection string; override with MONGODB_DB / MONGODB_COLLECTION (default "users").
+// ponytail: one shared client, lazy-connected, no pool tuning beyond the driver's own defaults. Enough for a single-tenant tool.
+let mongoUsersPromise = null;
+function mongoUsers() {
+  if (!mongoUsersPromise) {
+    const { MongoClient } = require('mongodb'); // required only when configured -> server runs dep-free unless MONGODB_URI is set
+    mongoUsersPromise = new MongoClient(process.env.MONGODB_URI).connect()
+      .then(c => c.db(process.env.MONGODB_DB).collection(process.env.MONGODB_COLLECTION || 'users'))
+      .catch(e => { mongoUsersPromise = null; throw e; }); // reset on failure so the next login retries
+  }
+  return mongoUsersPromise;
 }
 
-// Upsert the user record into Cosmos (SQL/Core API). Container must be partitioned on /email.
-function cosmosUpsertUser(user) {
-  return new Promise((resolve, reject) => {
-    const key = COSMOS.key || process.env.COSMOS_KEY;
-    const resId = `dbs/${process.env.COSMOS_DB}/colls/${process.env.COSMOS_CONTAINER}`;
-    const date = new Date().toUTCString();
-    const text = `post\ndocs\n${resId}\n${date.toLowerCase()}\n\n`;
-    const sig = crypto.createHmac('sha256', Buffer.from(key, 'base64')).update(text, 'utf8').digest('base64');
-    const auth = encodeURIComponent(`type=master&ver=1.0&sig=${sig}`);
-    const email = String(user.email).toLowerCase();
-    const body = JSON.stringify({ id: email, email, name: user.name || '', createdAt: new Date().toISOString() });
-    const url = new URL(`${COSMOS.endpoint.replace(/\/+$/, '')}/${resId}/docs`);
-    const req = https.request({ host: url.hostname, port: url.port || 443, path: url.pathname, method: 'POST', headers: {
-      Authorization: auth, 'x-ms-date': date, 'x-ms-version': '2018-12-31',
-      'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body),
-      'x-ms-documentdb-is-upsert': 'true', 'x-ms-documentdb-partitionkey': JSON.stringify([email]),
-    } }, resp => { let b = ''; resp.on('data', c => b += c); resp.on('end', () => resp.statusCode < 300 ? resolve() : reject(new Error(`Cosmos ${resp.statusCode}: ${b}`))); });
-    req.on('error', reject); req.write(body); req.end();
-  });
-}
-
-// The login hook: first-timers get persisted; returning users (already in R2) short-circuit. Never blocks sign-in.
+// The login hook: first-timers get recorded; returning logins are idempotent no-ops. Never blocks sign-in.
 async function recordUser(user) {
-  if (!user || !user.email || !(R2_ON && COSMOS_ON)) return;
+  if (!user || !user.email || !process.env.MONGODB_URI) return;
+  const email = String(user.email).toLowerCase();
   try {
-    if (await r2Exists(user.email)) return;   // returning user -> nothing to do
-    await cosmosUpsertUser(user);             // first login -> save details to Cosmos
-    await r2Mark(user.email);                 // then mark the gmail in R2 for next time
+    const users = await mongoUsers();
+    await users.updateOne(
+      { _id: email },
+      { $setOnInsert: { _id: email, email, name: user.name || '', createdAt: new Date() } },
+      { upsert: true },
+    );
   } catch (e) { console.error('recordUser:', e.message); }
 }
 
@@ -1033,6 +980,26 @@ const handler = async (req, res) => {
       return;
     }
 
+    // Console: run one command in the app's working dir (docker apps: inside the container), stream nothing — return output.
+    // ponytail: stateless one-shot shell — no PTY, `cd` doesn't persist between commands, 15s cap. Enough for a console.
+    if (req.method === 'POST' && parts[3] === 'exec' && parts.length === 4) {
+      const cmd = String((await readBody(req)).cmd || '').trim();
+      if (!cmd) return json(res, { error: 'A command is required' }, 400);
+      if (!app.cwd || !fs.existsSync(app.cwd)) return json(res, { error: 'No deployed code to run against yet' }, 400);
+      const [c, a, shell] = app.container
+        ? ['docker', ['exec', app.container, 'sh', '-c', cmd], false]
+        : [cmd, [], true]; // host shell, in app.cwd, with the app's env
+      let out = '', done = false;
+      const finish = (extra, code) => { if (done) return; done = true; clearTimeout(timer); json(res, { out: out + (extra || ''), code }); };
+      const child = spawn(c, a, { cwd: app.cwd, shell, env: { ...process.env, ...decEnv(app.env) } });
+      const cap = d => { out += d; if (out.length > 100_000) out = out.slice(-100_000); }; // bound the reply
+      const timer = setTimeout(() => { killTree(child.pid); finish('\n(timed out after 15s)', 124); }, 15_000);
+      child.stdout.on('data', cap); child.stderr.on('data', cap);
+      child.on('error', e => finish('\n' + e.message, 127));
+      child.on('close', code => finish('', code));
+      return;
+    }
+
     if (req.method === 'POST' && parts[3]) {
       const action = parts[3];
       // restart/redeploy/rollback are graceful: the running version keeps serving until the new one is healthy.
@@ -1105,16 +1072,8 @@ if (process.argv.includes('--check')) {
   assert.doesNotThrow(() => notifyDeploy({ name: 'x', url: 'u' }, 'running'));
   // Cookie parsing: split on the first '=' so hex session ids survive intact.
   assert.equal(parseCookies({ headers: { cookie: 'a=1; jc_session=deadbeef' } }).jc_session, 'deadbeef');
-  // Cosmos conn-string parsing: pull endpoint + key out of the connection string.
-  const cc = parseCosmosConn('AccountEndpoint=https://x.documents.azure.com:443/;AccountKey=YWJj;');
-  assert.equal(cc.endpoint, 'https://x.documents.azure.com:443/');
-  assert.equal(cc.key, 'YWJj');
-  // R2 object key: url-safe sha256 hex of the lowercased email (stable + case-insensitive).
-  assert.match(r2Key('User@Gmail.com'), /^users\/[0-9a-f]{64}$/);
-  assert.equal(r2Key('User@Gmail.com'), r2Key('user@gmail.com'));
-  // SigV4 amz-date: ISO -> YYYYMMDDTHHMMSSZ.
-  assert.equal(new Date('2026-08-10T12:34:56.789Z').toISOString().replace(/[:-]|\.\d{3}/g, ''), '20260810T123456Z');
-  // Persistence is a safe no-op when unconfigured (no R2/Cosmos env) — never throws.
+  // Persistence is a safe no-op when unconfigured (no MONGODB_URI) — never throws, never loads the driver.
+  delete process.env.MONGODB_URI;
   assert.doesNotThrow(() => recordUser({ email: 'x@y.com', name: 'X' }));
   // Metrics: memory always present with a sane 0–100 percentage; disk is null-or-valid.
   const mtr = metrics();
