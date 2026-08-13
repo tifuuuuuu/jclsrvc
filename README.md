@@ -1,6 +1,6 @@
 # Jerrick Cloud
 
-A tiny deploy platform for your own machine — an Azure App Service / Heroku you host at home. Give it a Git URL, a local folder, or a `.zip`; it detects the runtime (Node / Python / .NET / Docker / any `Procfile`), installs deps, and runs the app on a free port behind a reverse proxy at `http://<app>.localhost:8080`.
+A tiny deploy platform for your own machine — an Azure App Service / Heroku you host at home. Give it a Git URL, a local folder, or a `.zip`; it detects the runtime (Node / Python / .NET / Docker / static site / any `Procfile`), installs deps, and runs the app on a free port behind a reverse proxy at `http://<app>.localhost:8080`.
 
 ```bash
 node server.js            # http://localhost:8080
@@ -16,6 +16,7 @@ node server.js --check    # run the self-checks
 
 **Deploy**
 - **Git / local folder / zip / Docker** — three sources in the create dialog; a repo with a `Dockerfile` is built and run as a container (its own isolation).
+- **Static sites** — a folder with an `index.html` (or a built `dist/`, `public/`, `build/`, `out/`, `www/`) needs no runtime: it's served by [`static-server.js`](static-server.js) on the injected `PORT`, with an SPA fallback so client-side routes work. Detected last, so a real stack always wins — a Vite repo is a Node app, not a static one.
 - **Zero-downtime deploys** — redeploy / restart / rollback bring the new version up on a fresh port, health-check it, then cut traffic over and retire the old process. A failed build leaves the current version live.
 - **Auto-deploy on push** — each app has a webhook URL (Deployment Center → *Auto-deploy on git push*). Add it as a GitHub webhook and every push redeploys.
 - **History + rollback** — recent deploys are listed with their commit; roll a Git app back to any of them.
@@ -24,8 +25,14 @@ node server.js --check    # run the self-checks
 
 **Scale & access**
 - **Plans with real memory caps** — Scale up tab. Each plan (Free 512 MB → Premium 4 GB) sets a ceiling: an app that overruns is restarted, Node gets a matching `--max-old-space-size`, Docker a `--memory` limit.
+- **Idle sleep** — set a minutes-idle value (Configuration tab) and the app is stopped after that long without traffic, then started again on the next request through the proxy. Frees memory on a box running more apps than it uses; the first request after sleeping waits for the cold start (~0.5s for a small app). Sleeping apps stay asleep across a platform restart.
+- **Access restrictions** — password-protect an app (HTTP Basic, any username) and/or limit it to an IP allow list, enforced at the proxy before anything reaches the app. Covers the `*.localhost` subdomain, custom domains, and WebSocket upgrades alike. Worth setting on anything you expose through a tunnel — the platform listens on every interface, so an app is otherwise reachable by everything on your LAN.
 - **Sharing** — add collaborators by Google email (owner only); they see and control the app.
 - **API tokens** — issue a Bearer token (Configuration tab) and drive the API from a CLI / CI with `Authorization: Bearer <token>`.
+- **Scheduled jobs** — cron lines per app (`0 3 * * *`, `*/15 * * * *`, …) run a command in the app's folder with its env vars; Docker apps run theirs inside the container. Output lands in the log stream. A run that's still going when the job comes due again is skipped, never stacked.
+
+**Backup**
+- **Backup / restore** — ⬇ Backup on the dashboard downloads one JSON file: every app you can see, your API tokens, and the key that decrypts your env vars (so keep it somewhere safe — it's the whole platform). ⬆ Restore adds apps you don't already have, stopped, and never overwrites an existing app or replaces the encryption key already on this host.
 
 **Monitoring**
 - **Assistant tab** — ask Claude about your apps in plain language (*why did protein-left stop?*, *which app is using the most memory?*). It calls read-only tools over your live status, per-app memory/CPU, deploy history, host metrics, and stored logs before answering, so it quotes the actual error line and names the fix. Scoped to the apps you can see; environment variable **names** are visible to it, values never are. It can **propose** a restart or redeploy when its diagnosis calls for one — that only puts a Confirm button in the chat, which runs the same action the toolbar does; nothing happens until you click it. Everything else it explains and points you at the right tab. Set `ANTHROPIC_API_KEY` to turn it on.

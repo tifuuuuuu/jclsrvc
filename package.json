@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node server.js --check && node jc.js --check"
+    "check": "node server.js --check && node jc.js --check && node static-server.js --check"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.116.0",

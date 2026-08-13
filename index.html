@@ -114,6 +114,7 @@
   .s-stopped { background: var(--stop-bg); color: var(--stop); }
   .s-building, .s-queued { background: var(--info-bg); color: var(--info); }
   .s-failed { background: var(--bad-bg); color: var(--bad); }
+  .s-sleeping { background: var(--stop-bg); color: var(--stop); opacity: .85; }
 
   /* ---- app detail: header ---- */
   .res-header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 20px 24px 0; }
@@ -273,13 +274,19 @@
         <h1>App Services</h1>
         <div class="sub">Web apps deployed to Jerrick Cloud</div>
       </div>
-      <button class="btn primary" onclick="openCreate()">＋ New web app</button>
+      <div style="display:flex; gap:10px; align-items:center">
+        <button class="btn" onclick="backupNow()" title="Download every app definition + the key that decrypts their env vars">⬇ Backup</button>
+        <button class="btn" onclick="restorePick()" title="Add apps from a backup file (existing apps are left alone)">⬆ Restore</button>
+        <input type="file" id="restore-file" accept="application/json,.json" style="display:none" onchange="restoreFile(this)">
+        <button class="btn primary" onclick="openCreate()">＋ New web app</button>
+      </div>
     </div>
+    <div class="muted" id="backup-msg" style="margin:-6px 0 14px"></div>
 
     <div id="empty" class="empty" style="display:none">
       <div class="e-ico">🚀</div>
       <h3>No web apps yet</h3>
-      <div>Deploy a Node, Python, or .NET app from a Git repo or a local folder to get started.</div>
+      <div>Deploy a Node, Python, .NET, Docker, or static site from a Git repo, a local folder, or a zip to get started.</div>
       <button class="btn primary" onclick="openCreate()">＋ Create your first app</button>
     </div>
 
@@ -434,6 +441,48 @@
           </div>
           <div class="err" id="share-err"></div>
           <div id="share-list"></div>
+        </div>
+
+        <div class="card" style="max-width:720px; margin-top:16px">
+          <h3>Access restrictions</h3>
+          <p class="desc" style="margin-bottom:10px">Applied at the proxy, before a request reaches your app — so they cover the subdomain, custom domains, and WebSockets alike. Leave both blank to keep the app public. Takes effect immediately.</p>
+          <div class="kvrow" style="align-items:center">
+            <span class="k" style="width:150px">Password</span>
+            <input id="acc-pass" class="inp" type="password" placeholder="(none — app is public)" style="flex:1" autocomplete="new-password">
+          </div>
+          <p class="desc" style="margin:6px 0 12px">Visitors get a browser sign-in prompt (HTTP Basic; any username). Stored encrypted, never shown again.</p>
+          <div class="kvrow" style="align-items:flex-start">
+            <span class="k" style="width:150px; padding-top:8px">Allowed IPs</span>
+            <textarea id="acc-ips" class="inp mono" rows="2" spellcheck="false" placeholder="127.0.0.1&#10;192.168.1." style="flex:1; resize:vertical"></textarea>
+          </div>
+          <p class="desc" style="margin:6px 0 0">One per line — an exact address, or a prefix ending in a dot (<span class="mono">192.168.1.</span> = that whole subnet). Blank = any address.</p>
+          <div style="margin-top:14px; display:flex; gap:12px; align-items:center">
+            <button class="btn primary" onclick="saveAccess()">Save</button>
+            <span class="muted" id="acc-msg"></span>
+          </div>
+        </div>
+
+        <div class="card" style="max-width:720px; margin-top:16px">
+          <h3>Idle sleep</h3>
+          <p class="desc" style="margin-bottom:10px">Stop the app after a stretch with no traffic and start it again on the next request, so idle apps stop holding memory. The first request after sleeping waits for the app to boot. <b>0 = always on.</b></p>
+          <div style="display:flex; gap:8px; align-items:center">
+            <input id="idle-min" class="inp mono" type="number" min="0" max="1440" step="5" style="width:110px">
+            <span class="muted">minutes idle</span>
+            <button class="btn primary" onclick="saveIdle()">Save</button>
+            <span class="muted" id="idle-msg"></span>
+          </div>
+        </div>
+
+        <div class="card" style="max-width:720px; margin-top:16px">
+          <h3>Scheduled jobs</h3>
+          <p class="desc" style="margin-bottom:10px">Commands run on a cron schedule in your app's folder, with its environment variables (Docker apps: inside the container). Output goes to the log stream. A job still running when it comes due again is skipped.</p>
+          <div id="job-rows"></div>
+          <button class="btn" onclick="addJobRow()">＋ Add job</button>
+          <div style="margin-top:16px; display:flex; gap:12px; align-items:center">
+            <button class="btn primary" onclick="saveJobs()">Save</button>
+            <span class="muted" id="job-msg"></span>
+          </div>
+          <p class="desc" style="margin-top:12px">Five fields — <span class="mono">minute hour day month weekday</span>. <span class="mono">0 3 * * *</span> = 3am daily · <span class="mono">*/15 * * * *</span> = every 15 min · <span class="mono">0 9 * * 1</span> = Mondays 9am (Sunday = 0).</p>
         </div>
 
         <div class="card" style="max-width:720px; margin-top:16px" id="token-card">
@@ -594,7 +643,7 @@
       <div class="field">
         <label>Upload a .zip <span class="muted" style="font-weight:400">— optional, instead of a source</span></label>
         <input id="c-zip" type="file" accept=".zip" class="inp" style="width:100%; padding-top:7px">
-        <div class="hint">Zip the app folder with its manifest (package.json / requirements.txt / …) at the root. Max 50 MB.</div>
+        <div class="hint">Zip the app folder with its manifest (package.json / requirements.txt / …) — or a plain static site with <span class="mono">index.html</span> — at the root. Max 50 MB.</div>
       </div>
       <div class="field">
         <label>App Service plan (size)</label>
@@ -665,7 +714,7 @@
     $('#empty').style.display = apps.length ? 'none' : 'block';
     grid.innerHTML = apps.map(a => {
       const created = a.createdAt ? new Date(a.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : '';
-      const open = a.url && a.status === 'running'
+      const open = a.url && (a.status === 'running' || a.status === 'sleeping') // a sleeping app wakes on the first request
         ? `<a href="${esc(a.url)}" target="_blank" onclick="event.stopPropagation()">Open ↗</a>`
         : '<span class="muted">Not running</span>';
       return `<div class="app-card" onclick="showApp('${esc(a.name)}')">
@@ -723,8 +772,8 @@
     $('#app-name').textContent = a.name;
     $('#app-crumb').textContent = a.name;
     $('#ov-status').innerHTML = badge(a.status);
-    $('#ov-url').innerHTML = a.url && a.status === 'running'
-      ? `<a href="${esc(a.url)}" target="_blank">${esc(a.url)}</a>`
+    $('#ov-url').innerHTML = a.url && (a.status === 'running' || a.status === 'sleeping')
+      ? `<a href="${esc(a.url)}" target="_blank">${esc(a.url)}</a>${a.status === 'sleeping' ? ' <span class="muted">(sleeping — wakes on the first request)</span>' : ''}`
       : '<span class="muted">— (app not running)</span>';
     $('#ov-source').textContent = a.source;
     $('#ov-type').textContent = a.uploaded ? 'Zip upload (extracted)' : a.managed ? 'Git repository (cloned)' : 'Local folder (in place)';
@@ -742,6 +791,9 @@
     renderDomains(a);
     renderScale(a);
     $('#health-path').value = a.healthPath || '';
+    renderAccess(a);
+    renderJobs(a);
+    $('#idle-min').value = a.idleMin || 0;
     renderShare(a);
     $('#share-card').style.display = AUTH ? '' : 'none';   // sharing/tokens need sign-in to have an owner
     $('#token-card').style.display = AUTH ? '' : 'none';
@@ -781,6 +833,65 @@
     const j = await r.json();
     if (currentApp) currentApp.healthPath = j.healthPath || undefined;
     $('#health-msg').textContent = 'Saved — applies on the next health probe.';
+  }
+
+  // ---- access restrictions / idle sleep / scheduled jobs (all one settings endpoint) ----
+  async function saveSettings(patch, msgEl) {
+    const r = await fetch(`/api/apps/${currentName}/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+    const j = await r.json();
+    $(msgEl).textContent = j.error || 'Saved.';
+    if (!j.error) currentApp = j;
+    return j;
+  }
+  function renderAccess(a) {
+    $('#acc-pass').value = '';
+    $('#acc-pass').placeholder = a.hasPassword ? '(password set — type to replace, clear to remove)' : '(none — app is public)';
+    $('#acc-ips').value = (a.allowIps || []).join('\n');
+    $('#acc-msg').textContent = '';
+  }
+  async function saveAccess() {
+    const j = await saveSettings({ password: $('#acc-pass').value, allowIps: $('#acc-ips').value }, '#acc-msg');
+    if (j.error) return;
+    renderAccess(j); // re-render clears the message, so say it again afterwards
+    $('#acc-msg').textContent = j.hasPassword || (j.allowIps || []).length ? 'Saved — this app is now restricted.' : 'Saved — this app is public.';
+  }
+  async function saveIdle() { await saveSettings({ idleMin: Number($('#idle-min').value) || 0 }, '#idle-msg'); }
+
+  const jobRow = (s = '', c = '') => `<div class="kvrow">
+      <input class="job-s mono" placeholder="0 3 * * *" value="${esc(s)}" spellcheck="false" style="width:130px">
+      <input class="job-c mono" placeholder="npm run cleanup" value="${esc(c)}" spellcheck="false" style="flex:1">
+      <button class="rm" title="Remove" onclick="this.parentElement.remove()">✕</button>
+    </div>`;
+  function renderJobs(a) {
+    $('#job-rows').innerHTML = (a.jobs || []).map(j => jobRow(j.schedule, j.cmd)).join('');
+    $('#job-msg').textContent = '';
+  }
+  function addJobRow() { $('#job-rows').insertAdjacentHTML('beforeend', jobRow()); }
+  async function saveJobs() {
+    const jobs = [...document.querySelectorAll('#job-rows .kvrow')]
+      .map(r => ({ schedule: r.querySelector('.job-s').value.trim(), cmd: r.querySelector('.job-c').value.trim() }))
+      .filter(j => j.schedule && j.cmd);
+    const j = await saveSettings({ jobs }, '#job-msg');
+    if (j.error) return;
+    renderJobs(j);
+    $('#job-msg').textContent = `Saved — ${j.jobs.length} scheduled job${j.jobs.length === 1 ? '' : 's'}.`;
+  }
+
+  // ---- backup / restore (whole platform, not one app) ----
+  function backupNow() { location.href = '/api/backup'; }
+  function restorePick() { $('#restore-file').click(); }
+  async function restoreFile(input) {
+    const f = input.files[0]; input.value = '';
+    if (!f) return;
+    const msg = $('#backup-msg');
+    let data;
+    try { data = JSON.parse(await f.text()); } catch (_) { msg.textContent = 'That file is not valid JSON.'; return; }
+    if (!confirm(`Restore from ${f.name}?\n\nApps you don't already have are added (stopped, so nothing starts on its own). Existing apps are left untouched.`)) return;
+    const r = await fetch('/api/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    const j = await r.json();
+    if (j.error) { msg.textContent = j.error; return; }
+    msg.textContent = [`Restored ${j.added.length} app(s).`, j.skipped.length ? `Skipped ${j.skipped.length} already here.` : '', ...(j.notes || [])].filter(Boolean).join(' ');
+    showList();
   }
 
   // ---- sharing (collaborators) ----
@@ -922,7 +1033,7 @@
     const busy = a.status === 'building' || a.status === 'queued';
     const tb = (action, label, disabled) =>
       `<button class="tb-btn" ${disabled ? 'disabled' : ''} onclick="act('${action}')">${label}</button>`;
-    let html = running
+    let html = running || a.status === 'sleeping' // browsing a sleeping app is what wakes it
       ? `<a class="tb-btn" href="${esc(a.url)}" target="_blank">▶ Browse</a>`
       : `<button class="tb-btn" disabled>▶ Browse</button>`;
     html += running ? tb('stop', '⏹ Stop') : tb('start', '▶ Start', busy);

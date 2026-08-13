@@ -43,6 +43,9 @@ const METRICS_FILE = path.join(LOG_DIR, 'metrics.json'); // persisted host + per
 const SECRET_FILE = path.join(LOG_DIR, '.secret');       // 32-byte key for env-var-at-rest encryption
 const APP_METRIC_HISTORY = 240;                          // per-app samples kept (~1h at 15s)
 const HEALTH_TIMEOUT = 30_000;                           // zero-downtime: max wait for a new version to go healthy
+const STATIC_SERVER = path.join(ROOT, 'static-server.js'); // runtime for static sites (index.html, no other stack)
+const STATIC_DIRS = ['', 'dist', 'public', 'build', 'out', 'www']; // where a built site's index.html usually lands
+const CRON_INTERVAL = 30_000;                            // scheduled jobs tick — twice a minute so drift can't skip a minute
 // App Service plans -> a real memory ceiling (MB). Node also gets --max-old-space-size; any runtime is RSS-capped.
 const PLANS = { free: 512, basic: 1024, standard: 2048, premium: 4096 };
 const planMem = size => PLANS[String(size || 'free').toLowerCase()] || PLANS.free;
@@ -107,6 +110,9 @@ const lastAlert = {};                // resource -> ts of last threshold email (
 
 const REQ_CAP = 300;                 // recent proxied requests kept per app (Application Insights)
 const reqLog = new Map();            // name -> [{ ts, method, path, status, ms }]
+const lastReq = new Map();           // name -> ts of the last proxied request (drives idle sleep)
+const waking = new Map();            // name -> in-flight wake Promise (dedupes a burst of requests)
+const jobRunning = new Set();        // "app:index" of scheduled jobs still running (no overlapping runs)
 
 const logFile = name => path.join(LOG_DIR, slugify(name) + '.log');
 // Mirror a log chunk to disk so logs survive restarts and can be downloaded. Self-trims when it grows past the cap.
@@ -166,11 +172,36 @@ const decVal = v => {
 };
 const encEnv = e => Object.fromEntries(Object.entries(e || {}).map(([k, v]) => [k, encVal(v)]));
 const decEnv = e => Object.fromEntries(Object.entries(e || {}).map(([k, v]) => [k, decVal(v)]));
-// App object for API responses: env decrypted for display, everything else untouched.
-const publicApp = a => ({ ...a, env: decEnv(a.env) });
+// App object for API responses: env decrypted for display, the access password replaced by a boolean
+// (it protects the app itself — the portal never needs the value back), everything else untouched.
+const publicApp = a => ({ ...a, env: decEnv(a.env), accessPassword: undefined, hasPassword: !!a.accessPassword });
 // Who may see an app: with sign-in off, everyone; otherwise its owner, its collaborators, and
 // legacy apps that predate owners. Single rule for the apps API and the assistant's tools alike.
 const canSee = (a, user) => !AUTH_ON || !a.owner || !!(user && (a.owner === user.email || (a.collaborators || []).includes(user.email)));
+
+// ---- per-app access restrictions (enforced at the proxy, before anything reaches the app) ----
+// The platform listens on every interface, so without this every app is open to the LAN and to any
+// tunnel pointed at it. Two independent gates, both optional: an IP allow list and a password.
+// ponytail: allow-list entries are an exact IP or a prefix ending in "." / ":" ("192.168.1.") — no CIDR math.
+const ipOf = req => String(req.socket.remoteAddress || '').replace(/^::ffff:/, ''); // never trust X-Forwarded-For here
+const ipAllowed = (list, ip) => !list || !list.length ||
+  list.some(e => (e.endsWith('.') || e.endsWith(':')) ? ip.startsWith(e) : ip === e);
+// Constant-time compare over digests, so lengths can differ without leaking via timing.
+const sameSecret = (a, b) => {
+  const h = s => crypto.createHash('sha256').update(String(s)).digest();
+  return crypto.timingSafeEqual(h(a), h(b));
+};
+// null = let it through; otherwise the response to send instead (401 challenge / 403).
+function accessDenied(app, req) {
+  if (!ipAllowed(app.allowIps, ipOf(req)))
+    return { code: 403, body: 'Forbidden — your address is not on this app\'s allow list.' };
+  const pass = app.accessPassword ? decVal(app.accessPassword) : '';
+  if (!pass) return null;
+  const m = (req.headers.authorization || '').match(/^Basic\s+(\S+)$/i);
+  const supplied = m ? Buffer.from(m[1], 'base64').toString('utf8').split(':').slice(1).join(':') : '';
+  if (supplied && sameSecret(supplied, pass)) return null;
+  return { code: 401, headers: { 'WWW-Authenticate': `Basic realm="${app.name}"` }, body: 'Authentication required.' };
+}
 
 // ---- health probes (used by zero-downtime cutover + the periodic health check) ----
 function tcpOk(port, timeout = 2500) {
@@ -335,6 +366,13 @@ function detectRuntime(cwd) {
   else if (hasExt(/\.(sln|slnx|csproj|fsproj)$/i))
     rt = { name: '.NET', install: 'dotnet restore', start: 'dotnet run' };
 
+  // Last resort: a plain static site — index.html at the root, or a pre-built dist/ committed to the repo.
+  // Served by static-server.js on the injected PORT, so proxying/health/metrics work like any other app.
+  if (!rt) {
+    const dir = STATIC_DIRS.find(d => has(path.join(d, 'index.html')));
+    if (dir !== undefined) rt = { name: 'Static', install: null, start: `node ${JSON.stringify(STATIC_SERVER)} ${JSON.stringify(dir || '.')}` };
+  }
+
   const web = procfileEntry(cwd, 'web');
   if (web && !(rt && rt.docker)) rt = { name: rt ? rt.name : 'Procfile', install: rt ? rt.install : null, start: web };
   if (rt) rt.release = procfileEntry(cwd, 'release'); // optional one-off pre-start command (migrations, asset build…)
@@ -379,7 +417,7 @@ async function deploy(app, token, checkout) {
   // platform's own package.json and run server.js (Jerrick Cloud) as the "app" — it kills its own tree.
   const rt = detectRuntime(cwd);
   if (!rt) {
-    pushLog(app.name, `Couldn't detect a runtime. Supported: Node (package.json), Python (requirements.txt/app.py), .NET (.sln/.csproj), or any repo with a Procfile ("web: <command>").`);
+    pushLog(app.name, `Couldn't detect a runtime. Supported: Node (package.json), Python (requirements.txt/app.py), .NET (.sln/.csproj), Docker (Dockerfile), a static site (index.html, or one in dist/ public/ build/), or any repo with a Procfile ("web: <command>").`);
     return failDeploy(app);
   }
   app.runtime = rt.name;
@@ -488,19 +526,46 @@ function onExit(name, code) {
 function stopApp(app) {
   app.desired = 'stopped'; // explicit stop → don't auto-restart, don't auto-start on boot
   restartHist.delete(app.name);
+  killProc(app);
+  app.sleeping = false;
+  setStatus(app.name, 'stopped');
+}
+
+// Kill an app's process/container without touching `desired` — shared by stop and idle-sleep.
+function killProc(app) {
   const child = procs.get(app.name);
   if (child) child.removeAllListeners('exit'); // don't let the death we're about to cause trigger auto-restart
   killTree(app.pid);
   if (app.container) dockerRm(app.container); // stop the container too (docker run --rm leaves it otherwise)
   procs.delete(app.name);
   app.pid = null; app.container = null;
-  setStatus(app.name, 'stopped');
+}
+
+// ---- idle sleep / wake on request ----
+// An app with idleMin set is stopped after that long without a proxied request and marked "sleeping":
+// `desired` stays 'running', so the next request through the proxy starts it again (see wakeApp).
+function sleepApp(app) {
+  killProc(app);
+  app.sleeping = true;
+  pushLog(app.name, `Idle for ${app.idleMin} min — sleeping to free memory. The next request wakes it.`);
+  setStatus(app.name, 'sleeping');
+}
+// Wake and wait until it actually serves. Concurrent requests share one wake, so a burst starts one process.
+function wakeApp(app) {
+  if (waking.has(app.name)) return waking.get(app.name);
+  const p = (async () => {
+    pushLog(app.name, 'Request received — waking from idle sleep…');
+    app.sleeping = false;
+    await bootApp(app); // start in place, or redeploy if the code is gone
+    if (app.port) await waitHealthy(app.port, app.healthPath, procs.get(app.name));
+  })().finally(() => waking.delete(app.name));
+  waking.set(app.name, p);
+  return p;
 }
 
 // Bring an app back after a server boot: start in place if we already have its code, else (re)deploy to fetch it.
 function bootApp(app) {
-  if (app.cwd && fs.existsSync(app.cwd)) startApp(app);
-  else deploy(app);
+  return (app.cwd && fs.existsSync(app.cwd)) ? startApp(app) : deploy(app);
 }
 
 // Probe every running app (HTTP health path if configured, else TCP). Repeated failures = hung app → restart (throttled to once/min).
@@ -538,6 +603,11 @@ function startMetricSampler() {
 async function sampleApps() {
   for (const a of apps) {
     if (a.status !== 'running' || !a.pid) continue;
+    // Idle sleep: no proxied request for idleMin minutes → stop the process, keep it wakeable.
+    if (a.idleMin > 0 && a.desired === 'running' && !waking.has(a.name)) {
+      const since = lastReq.get(a.name) || Date.parse(a.startedAt) || Date.now();
+      if (Date.now() - since > a.idleMin * 60_000) { sleepApp(a); continue; }
+    }
     const st = await pidStat(a.pid);
     const cpu = pidCpuPct(a.name, a.pid, st.cpuMs);
     const hist = appMetrics.get(a.name) || [];
@@ -555,6 +625,88 @@ async function sampleApps() {
     } else memViol.set(a.name, 0);
   }
 }
+// ---- scheduled jobs (per-app cron) ----
+// Standard 5-field cron: minute hour day-of-month month day-of-week, with *, */step, a-b ranges and
+// comma lists. Local time, minute resolution, Sunday = 0. Anything unparseable matches nothing.
+function cronField(spec, min, max) {
+  const out = new Set();
+  for (const part of String(spec).split(',')) {
+    const m = part.trim().match(/^(\*|\d+)(?:-(\d+))?(?:\/(\d+))?$/);
+    if (!m) return new Set(); // one bad field → the whole expression never fires
+    const step = Math.max(1, +(m[3] || 1));
+    const lo = m[1] === '*' ? min : +m[1];
+    const hi = m[2] != null ? +m[2] : (m[1] === '*' || m[3] ? max : lo); // "5" = just 5; "5/10" = 5,15,25…
+    for (let v = Math.max(lo, min); v <= Math.min(hi, max); v += step) out.add(v);
+  }
+  return out;
+}
+const CRON_RANGES = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]];
+function cronMatch(expr, d) {
+  const f = String(expr).trim().split(/\s+/);
+  if (f.length !== 5) return false;
+  const vals = [d.getMinutes(), d.getHours(), d.getDate(), d.getMonth() + 1, d.getDay()];
+  return vals.every((v, i) => cronField(f[i], CRON_RANGES[i][0], CRON_RANGES[i][1]).has(v));
+}
+const cronValid = expr => String(expr).trim().split(/\s+/).length === 5 &&
+  String(expr).trim().split(/\s+/).every((p, i) => cronField(p, CRON_RANGES[i][0], CRON_RANGES[i][1]).size > 0);
+
+// Tick every minute; run each app's due jobs in its working dir with its env (Docker apps: inside the
+// container). A job still running when it comes due again is skipped rather than stacked up.
+let lastCronMinute = null;
+function runJobs(now = new Date()) {
+  const minute = Math.floor(now.getTime() / 60_000);
+  if (minute === lastCronMinute) return; // an interval that drifts must not fire twice in one minute
+  lastCronMinute = minute;
+  for (const app of apps) {
+    for (const [i, job] of (app.jobs || []).entries()) {
+      if (!job.cmd || !cronMatch(job.schedule, now)) continue;
+      const key = `${app.name}:${i}`;
+      if (jobRunning.has(key)) { pushLog(app.name, `⏱ Job "${job.cmd}" is still running — skipping this run.`); continue; }
+      if (!app.cwd || !fs.existsSync(app.cwd)) { pushLog(app.name, `⏱ Job skipped — no deployed code yet.`); continue; }
+      if (app.container && !procs.get(app.name)) { pushLog(app.name, `⏱ Job skipped — container is not running.`); continue; }
+      jobRunning.add(key);
+      pushLog(app.name, `⏱ Scheduled job (${job.schedule}): ${job.cmd}`);
+      const p = app.container
+        ? run(app.name, 'docker', ['exec', app.container, 'sh', '-c', job.cmd], app.cwd, false)
+        : run(app.name, job.cmd, [], app.cwd, true, { ...process.env, ...decEnv(app.env), PORT: String(app.port || '') });
+      p.finally(() => jobRunning.delete(key));
+    }
+  }
+}
+
+// ---- backup / restore of platform state ----
+// One JSON file: app definitions (env still encrypted), the caller's API tokens, and — when the key
+// lives in logs/.secret rather than JC_SECRET — that key, since without it the env vars won't decrypt.
+function backup(visible) {
+  const mine = apps.filter(visible);
+  const owners = new Set(mine.map(a => a.owner).filter(Boolean));
+  let secret = null;
+  if (!process.env.JC_SECRET) try { secret = fs.readFileSync(SECRET_FILE).toString('base64'); } catch (_) {}
+  return {
+    v: 1, ts: new Date().toISOString(), apps: mine, secret,
+    tokens: Object.fromEntries(Object.entries(tokens).filter(([, email]) => owners.has(email))),
+  };
+}
+// Additive by design: an app whose name already exists is skipped, never overwritten, and restored apps
+// land stopped so nothing launches behind your back. The existing encryption key is never replaced.
+function restore(data) {
+  const notes = [];
+  if (data.secret && !process.env.JC_SECRET) {
+    if (fs.existsSync(SECRET_FILE)) notes.push('Kept the existing encryption key — env vars from another host may not decrypt.');
+    else { try { fs.writeFileSync(SECRET_FILE, Buffer.from(data.secret, 'base64'), { mode: 0o600 }); _encKey = null; } catch (_) {} }
+  }
+  const added = [], skipped = [];
+  for (const a of Array.isArray(data.apps) ? data.apps : []) {
+    if (!a || !a.name) continue;
+    if (find(a.name)) { skipped.push(a.name); continue; }
+    apps.push({ ...a, pid: null, container: null, sleeping: false, status: 'stopped', desired: 'stopped', health: 'unknown' });
+    added.push(a.name);
+  }
+  if (data.tokens && typeof data.tokens === 'object') { Object.assign(tokens, data.tokens); saveTokens(); }
+  save();
+  return { added, skipped, notes };
+}
+
 function checkAlert(resource, pct) {
   if (pct < ALERT_PCT || Date.now() - (lastAlert[resource] || 0) < ALERT_EVERY) return;
   lastAlert[resource] = Date.now();
@@ -784,7 +936,7 @@ function readBody(req) {
 
 // Reverse proxy: requests to <app>.localhost:PORT (or a mapped custom domain) are forwarded to that app's internal port.
 // *.localhost resolves to 127.0.0.1 in modern browsers with no DNS/hosts setup.
-function proxyToApp(name, req, res) {
+async function proxyToApp(name, req, res) {
   const app = find(name);
   // Every request through the proxy is telemetry: status + latency, for the Insights blade.
   // ponytail: in-memory ring, lost on server restart (the log file isn't) — persist it if post-mortems need it.
@@ -795,6 +947,18 @@ function proxyToApp(name, req, res) {
     while (h.length > REQ_CAP) h.shift();
     reqLog.set(name, h);
   };
+  lastReq.set(name, Date.now()); // idle clock — set before any gate, a blocked request is still traffic
+
+  if (app) {
+    const denied = accessDenied(app, req); // password / IP gate: refuse before the app is even woken
+    if (denied) {
+      track(denied.code);
+      res.writeHead(denied.code, { 'Content-Type': 'text/html; charset=utf-8', ...(denied.headers || {}) });
+      return res.end(`<h2>${denied.code} &middot; ${name}</h2><p>${denied.body}</p>`);
+    }
+    if (app.sleeping && !procs.get(name)) await wakeApp(app); // wake on request, then serve it
+  }
+
   if (!app || !app.port || !procs.get(name)) { // gate on a live process, not the status label → zero-downtime rebuilds keep serving
     if (app) track(502);
     res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -1044,6 +1208,18 @@ const handler = async (req, res) => {
     if (req.method === 'GET') return json(res, { hasToken: Object.values(tokens).includes(req.user.email) });
   }
 
+  // Backup: download every app you can see (env still encrypted) + the key that decrypts it. Restore is additive.
+  if (req.method === 'GET' && u.pathname === '/api/backup') {
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': `attachment; filename="jerrick-backup-${stamp}.json"` });
+    return res.end(JSON.stringify(backup(a => canSee(a, req.user)), null, 2));
+  }
+  if (req.method === 'POST' && u.pathname === '/api/restore') {
+    const body = await readBody(req);
+    if (!body || !Array.isArray(body.apps)) return json(res, { error: 'That is not a Jerrick Cloud backup file' }, 400);
+    return json(res, restore(body));
+  }
+
   if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/index.html')) {
     return fs.readFile(path.join(ROOT, 'index.html'), (e, data) => {
       if (e) { res.writeHead(404); return res.end('index.html not found'); }
@@ -1123,6 +1299,37 @@ const handler = async (req, res) => {
       if (!PLANS[size]) return json(res, { error: 'Unknown plan' }, 400);
       app.size = size; save();
       return json(res, { ok: true, size, memMb: planMem(size) }); // applies on next start/restart
+    }
+
+    // Access restrictions, idle sleep, and scheduled jobs — one route, each field optional.
+    if (req.method === 'PUT' && parts[3] === 'settings' && parts.length === 4) {
+      const body = await readBody(req);
+      if ('password' in body) { // '' clears it
+        const p = String(body.password || '');
+        app.accessPassword = p ? encVal(p) : undefined;
+      }
+      if ('allowIps' in body) {
+        const list = (Array.isArray(body.allowIps) ? body.allowIps : String(body.allowIps || '').split(/[\s,]+/))
+          .map(s => String(s).trim()).filter(Boolean);
+        const bad = list.find(e => !/^[0-9a-f.:]+$/i.test(e));
+        if (bad) return json(res, { error: `"${bad}" is not an IP address or prefix` }, 400);
+        app.allowIps = list;
+      }
+      if ('idleMin' in body) {
+        const n = Math.max(0, Math.min(1440, Math.round(Number(body.idleMin) || 0)));
+        app.idleMin = n || undefined;
+        if (!n && app.sleeping) { app.sleeping = false; startApp(app); } // idle sleep off → bring it back up
+      }
+      if ('jobs' in body) {
+        const jobs = (Array.isArray(body.jobs) ? body.jobs : []).slice(0, 20)
+          .map(j => ({ schedule: String(j.schedule || '').trim(), cmd: String(j.cmd || '').trim() }))
+          .filter(j => j.schedule && j.cmd);
+        const bad = jobs.find(j => !cronValid(j.schedule));
+        if (bad) return json(res, { error: `"${bad.schedule}" is not a valid cron schedule (5 fields, e.g. "0 3 * * *")` }, 400);
+        app.jobs = jobs;
+      }
+      save();
+      return json(res, publicApp(app));
     }
 
     if (req.method === 'PUT' && parts[3] === 'health' && parts.length === 4) {
@@ -1243,10 +1450,14 @@ const handler = async (req, res) => {
 const server = SSL ? https.createServer(SSL, handler) : http.createServer(handler);
 
 // WebSocket upgrades: raw-pipe the client socket to the target app's port (subdomain or custom domain).
-server.on('upgrade', (req, socket, head) => {
+server.on('upgrade', async (req, socket, head) => {
   const name = hostToApp((req.headers.host || '').split(':')[0]);
   const app = name && find(name);
-  if (!app || !app.port || !procs.get(name)) return socket.destroy();
+  if (!app) return socket.destroy();
+  if (accessDenied(app, req)) return socket.destroy(); // same password / IP gate as plain HTTP
+  lastReq.set(name, Date.now());
+  if (app.sleeping && !procs.get(name)) await wakeApp(app);
+  if (!app.port || !procs.get(name)) return socket.destroy();
   const up = net.connect(app.port, '127.0.0.1', () => {
     up.write(`${req.method} ${req.url} HTTP/1.1\r\n` +
       Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n');
@@ -1324,6 +1535,63 @@ if (process.argv.includes('--check')) {
   const _ins = insights({ name: '__no_such_app__', status: 'stopped' });
   assert.equal(_ins.lines, 0); assert.equal(_ins.counts.error, 0); assert.equal(_ins.lastError, null);
   assert.equal(_ins.requests.total, 0); assert.equal(_ins.requests.avgMs, null); assert.deepEqual(_ins.results, []);
+  // Static-site detection: index.html (root or a built subdir) is the last-resort runtime, and it must
+  // never win over a real stack — a Vite repo has both package.json and index.html and is a Node app.
+  const _tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jc-rt-'));
+  assert.equal(detectRuntime(_tmp), null);                                     // empty dir → nothing to run
+  fs.writeFileSync(path.join(_tmp, 'index.html'), '<h1>hi</h1>');
+  assert.equal(detectRuntime(_tmp).name, 'Static');
+  assert.ok(detectRuntime(_tmp).start.includes('static-server.js'));
+  assert.equal(detectRuntime(_tmp).install, null);                             // never npm-install a static site
+  fs.writeFileSync(path.join(_tmp, 'package.json'), '{}');
+  assert.equal(detectRuntime(_tmp).name, 'Node');                              // real stack wins
+  fs.rmSync(_tmp, { recursive: true, force: true });
+  // A built site in dist/ is found too, and both paths stay quoted — this repo lives under "App service".
+  const _tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'jc rt-')); // note the space in the temp dir name
+  fs.mkdirSync(path.join(_tmp2, 'dist'));
+  fs.writeFileSync(path.join(_tmp2, 'dist', 'index.html'), '<h1>built</h1>');
+  assert.match(detectRuntime(_tmp2).start, /^node "[^"]*static-server\.js" "dist"$/);
+  fs.rmSync(_tmp2, { recursive: true, force: true });
+  // IP allow list: empty = open, exact match, prefix match, and everything else refused.
+  assert.ok(ipAllowed([], '10.0.0.9') && ipAllowed(null, '10.0.0.9'));
+  assert.ok(ipAllowed(['127.0.0.1'], '127.0.0.1') && !ipAllowed(['127.0.0.1'], '127.0.0.2'));
+  assert.ok(ipAllowed(['192.168.1.'], '192.168.1.55') && !ipAllowed(['192.168.1.'], '192.168.2.55'));
+  assert.equal(ipOf({ socket: { remoteAddress: '::ffff:192.168.1.7' } }), '192.168.1.7');
+  // Access gate: open by default; password → 401 challenge until the right one arrives; wrong IP → 403.
+  const _basic = p => ({ headers: { authorization: 'Basic ' + Buffer.from('x:' + p).toString('base64') }, socket: { remoteAddress: '127.0.0.1' } });
+  const _open = { name: 'a' }, _locked = { name: 'a', accessPassword: encVal('hunter2') };
+  assert.equal(accessDenied(_open, _basic('')), null);
+  assert.equal(accessDenied(_locked, { headers: {}, socket: { remoteAddress: '127.0.0.1' } }).code, 401);
+  assert.equal(accessDenied(_locked, _basic('wrong')).code, 401);
+  assert.equal(accessDenied(_locked, _basic('hunter2')), null);
+  assert.equal(accessDenied({ name: 'a', allowIps: ['10.0.0.1'] }, _basic('')).code, 403);
+  // Cron: field expansion, then whole-expression matching against a real Date.
+  assert.deepEqual([...cronField('*/15', 0, 59)], [0, 15, 30, 45]);
+  assert.deepEqual([...cronField('5', 0, 59)], [5]);
+  assert.deepEqual([...cronField('1-3,9', 0, 59)], [1, 2, 3, 9]);
+  assert.equal(cronField('bad', 0, 59).size, 0);
+  assert.equal(cronField('99', 0, 59).size, 0);                                // out of range → never fires
+  const _at = (h, mi, day = 4) => new Date(2026, 7, 13 + (day - 4), h, mi);    // 2026-08-13 is a Thursday
+  assert.ok(cronMatch('0 3 * * *', _at(3, 0)) && !cronMatch('0 3 * * *', _at(3, 1)));
+  assert.ok(cronMatch('*/15 * * * *', _at(9, 30)) && !cronMatch('*/15 * * * *', _at(9, 31)));
+  assert.ok(cronMatch('0 9 * * 1', _at(9, 0, 1)) && !cronMatch('0 9 * * 1', _at(9, 0, 4))); // Mondays only
+  assert.ok(!cronMatch('* * * *', _at(0, 0)) && !cronMatch('', _at(0, 0)));    // wrong field count
+  assert.ok(cronValid('0 3 * * *') && !cronValid('0 3 * *') && !cronValid('99 3 * * *'));
+  // runJobs is minute-deduped: the same minute twice is a no-op (an interval that drifts can't double-fire).
+  lastCronMinute = null; assert.doesNotThrow(() => { runJobs(); runJobs(); });
+  // Backup keeps only apps you can see; restore is additive and never overwrites an existing app.
+  const _bk = backup(a => a.name === '__no_such_app__');
+  assert.deepEqual(_bk.apps, []); assert.equal(_bk.v, 1);
+  const _r = restore({ apps: [{ name: '__restore_test__', source: 'x', status: 'running', desired: 'running', pid: 999 }] });
+  assert.deepEqual(_r.added, ['__restore_test__']);
+  assert.equal(find('__restore_test__').status, 'stopped');                    // restored apps never auto-launch
+  assert.equal(find('__restore_test__').pid, null);
+  assert.deepEqual(restore({ apps: [{ name: '__restore_test__' }] }), { added: [], skipped: ['__restore_test__'], notes: [] });
+  apps = apps.filter(a => a.name !== '__restore_test__'); save();
+  // publicApp never hands the access password back to the browser — just whether one is set.
+  const _pw = publicApp({ name: 'x', env: {}, accessPassword: encVal('s3cret') });
+  assert.equal(_pw.accessPassword, undefined); assert.equal(_pw.hasPassword, true);
+  assert.equal(publicApp({ name: 'x', env: {} }).hasPassword, false);
   // Collaborator email guard: accept a real address, reject junk.
   const emailOk = e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e);
   assert.ok(emailOk('a@b.com') && !emailOk('nope'));
@@ -1374,12 +1642,15 @@ if (process.argv.includes('--check')) {
     if (!a.domains) a.domains = [];
     if (!a.deploys) a.deploys = [];
     if (!a.collaborators) a.collaborators = [];
-    a.status = a.desired === 'running' ? 'queued' : 'stopped';
+    if (!a.jobs) a.jobs = [];
+    // A sleeping app stays asleep across a restart — that's the point of it — and wakes on its next request.
+    a.status = a.sleeping ? 'sleeping' : a.desired === 'running' ? 'queued' : 'stopped';
   }
   save();
   server.listen(PORT, () => console.log(`Jerrick Cloud running -> ${PROTO}://localhost:${PORT}`));
   // Bring back everything that was running before the reboot (staggered so ports settle), then watch health + metrics.
-  apps.filter(a => a.desired === 'running').forEach((a, i) => setTimeout(() => bootApp(a), 800 + i * 500));
+  apps.filter(a => a.desired === 'running' && !a.sleeping).forEach((a, i) => setTimeout(() => bootApp(a), 800 + i * 500));
   setInterval(healthCheck, HEALTH_INTERVAL).unref();
+  setInterval(runJobs, CRON_INTERVAL).unref();
   startMetricSampler();
 }
