@@ -1,4 +1,4 @@
-// Jerrick Cloud — minimal real deploy engine (zero dependencies).
+// Jerrick Cloud — minimal real deploy engine.
 // Give it a Git URL or a local folder; it runs `npm install` then `npm start`
 // on a free port (PORT injected) and the app is live at http://localhost:<port>.
 // Scope: Node web apps, single-user local tool. It runs your code by design.
@@ -13,6 +13,8 @@ const { spawn } = require('child_process');
 const tls = require('tls');
 const https = require('https');
 const crypto = require('crypto');
+const Anthropic = require('@anthropic-ai/sdk');
+const { betaTool } = require('@anthropic-ai/sdk/helpers/beta/json-schema');
 
 const ROOT = __dirname;
 const STATE_FILE = path.join(ROOT, 'apps.json');
@@ -103,6 +105,9 @@ const lastHealthRestart = new Map(); // name -> ts of last health-triggered rest
 const metricHistory = [];            // ring buffer of { ts, mem, disk } host samples
 const lastAlert = {};                // resource -> ts of last threshold email (throttle)
 
+const REQ_CAP = 300;                 // recent proxied requests kept per app (Application Insights)
+const reqLog = new Map();            // name -> [{ ts, method, path, status, ms }]
+
 const logFile = name => path.join(LOG_DIR, slugify(name) + '.log');
 // Mirror a log chunk to disk so logs survive restarts and can be downloaded. Self-trims when it grows past the cap.
 function appendLogFile(name, text) {
@@ -112,6 +117,12 @@ function appendLogFile(name, text) {
     if (fs.statSync(f).size > LOG_FILE_CAP) fs.writeFileSync(f, fs.readFileSync(f).slice(-LOG_FILE_CAP / 2));
   } catch (_) {}
 }
+
+// Severity of a stored log line, so Insights can filter to just the errors. Keyword match — apps
+// log in every format under the sun, so this is deliberately loose rather than a parser.
+const ERR_RE = /(\berrors?\b|[a-z]*Error\b|\bexception\b|\bfail(ed|ure|s)?\b|\bfatal\b|\bunhandled|traceback|EADDRINUSE|ECONNREFUSED|ENOENT|MODULE_NOT_FOUND)/i;
+const WARN_RE = /(\bwarn(ing)?s?\b|\bdeprecat)/i;
+const levelOf = line => ERR_RE.test(line) ? 'error' : WARN_RE.test(line) ? 'warn' : 'info';
 
 const find = name => apps.find(a => a.name === name);
 const save = () => fs.writeFileSync(STATE_FILE, JSON.stringify(apps, null, 2));
@@ -157,6 +168,9 @@ const encEnv = e => Object.fromEntries(Object.entries(e || {}).map(([k, v]) => [
 const decEnv = e => Object.fromEntries(Object.entries(e || {}).map(([k, v]) => [k, decVal(v)]));
 // App object for API responses: env decrypted for display, everything else untouched.
 const publicApp = a => ({ ...a, env: decEnv(a.env) });
+// Who may see an app: with sign-in off, everyone; otherwise its owner, its collaborators, and
+// legacy apps that predate owners. Single rule for the apps API and the assistant's tools alike.
+const canSee = (a, user) => !AUTH_ON || !a.owner || !!(user && (a.owner === user.email || (a.collaborators || []).includes(user.email)));
 
 // ---- health probes (used by zero-downtime cutover + the periodic health check) ----
 function tcpOk(port, timeout = 2500) {
@@ -772,17 +786,184 @@ function readBody(req) {
 // *.localhost resolves to 127.0.0.1 in modern browsers with no DNS/hosts setup.
 function proxyToApp(name, req, res) {
   const app = find(name);
+  // Every request through the proxy is telemetry: status + latency, for the Insights blade.
+  // ponytail: in-memory ring, lost on server restart (the log file isn't) — persist it if post-mortems need it.
+  const t0 = Date.now();
+  const track = status => {
+    const h = reqLog.get(name) || [];
+    h.push({ ts: Date.now(), method: req.method, path: req.url.split('?')[0].slice(0, 200), status, ms: Date.now() - t0 });
+    while (h.length > REQ_CAP) h.shift();
+    reqLog.set(name, h);
+  };
   if (!app || !app.port || !procs.get(name)) { // gate on a live process, not the status label → zero-downtime rebuilds keep serving
+    if (app) track(502);
     res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(`<h2>502 &middot; ${name}</h2><p>This app is not running on Jerrick Cloud.</p>`);
   }
   const headers = { ...req.headers, 'x-forwarded-host': req.headers.host, 'x-forwarded-proto': PROTO, 'x-forwarded-for': req.socket.remoteAddress };
   const up = http.request({ host: '127.0.0.1', port: app.port, method: req.method, path: req.url, headers }, upRes => {
+    track(upRes.statusCode);
     res.writeHead(upRes.statusCode, upRes.headers);
     upRes.pipe(res);
   });
-  up.on('error', e => { if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain' }); res.end('502 Bad Gateway: ' + e.message); });
+  up.on('error', e => { track(502); if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain' }); res.end('502 Bad Gateway: ' + e.message); });
   req.pipe(up);
+}
+
+// ---- Application Insights ----
+// Query the logs already stored on disk by appendLogFile (nothing new is stored) plus the values you
+// look up when an app misbehaves: error/warning counts, the last error, request volume + failure rate +
+// latency from the proxy, and memory/CPU peaks from the metric sampler.
+// ponytail: full-file scan + substring match per query, no index. The log file is capped at 2 MB — fine.
+function insights(app, { q = '', level = 'all', limit = 200 } = {}) {
+  let lines = [];
+  try { lines = fs.readFileSync(logFile(app.name), 'utf8').split(/\r?\n/).filter(Boolean); } catch (_) {} // no log file yet
+  const counts = { error: 0, warn: 0, info: 0 };
+  const needle = q.toLowerCase();
+  const hits = [];
+  let lastError = null;
+  for (const text of lines) {
+    const lvl = levelOf(text);
+    counts[lvl]++;
+    if (lvl === 'error') lastError = text;
+    if (level !== 'all' && lvl !== level) continue;
+    if (needle && !text.toLowerCase().includes(needle)) continue;
+    hits.push({ level: lvl, text });
+  }
+  const reqs = reqLog.get(app.name) || [];
+  const times = reqs.map(r => r.ms).sort((a, b) => a - b);
+  const hist = appMetrics.get(app.name) || [];
+  const peak = k => hist.length ? Math.max(...hist.map(h => h[k] || 0)) : null;
+  return {
+    status: app.status, health: app.health || 'unknown', restarts: app.restarts || 0,
+    lines: lines.length, counts, lastError,
+    requests: {
+      total: reqs.length,
+      failed: reqs.filter(r => r.status >= 500).length,
+      clientErrors: reqs.filter(r => r.status >= 400 && r.status < 500).length,
+      avgMs: times.length ? Math.round(times.reduce((s, v) => s + v, 0) / times.length) : null,
+      p95Ms: times.length ? times[Math.min(times.length - 1, Math.floor(times.length * 0.95))] : null,
+      failures: reqs.filter(r => r.status >= 400).slice(-25).reverse(), // newest first
+    },
+    peakRss: peak('rss'), peakCpu: peak('cpu'),
+    matched: hits.length, results: hits.slice(-limit).reverse(), // newest first
+  };
+}
+
+// ---- AI assistant ----
+// Claude answers questions about the platform by calling the read-only tools below over the same
+// data the dashboard shows. Two env vars, both read by the SDK itself — no other config:
+//   ANTHROPIC_API_KEY   your key. Unset => the assistant is off and everything else still runs.
+//   ANTHROPIC_BASE_URL  optional; point it at a gateway/proxy instead of api.anthropic.com.
+// Env var VALUES are never sent — only their names — so secrets stay on this machine.
+// ponytail: read-only tools, no streaming. It diagnoses and tells you what to click; it doesn't
+//   restart or scale anything. Add a write tool behind a confirm step if you want it to act.
+const ASSISTANT_MODEL = process.env.ANTHROPIC_MODEL || 'claude-opus-5';
+let _llm = null;
+const llm = () => _llm || (_llm = new Anthropic()); // reads ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
+
+const ASSISTANT_SYSTEM = `You are the Jerrick Cloud assistant, built into a self-hosted web app platform (an Azure App Service for one machine). Apps are deployed from a Git URL, a local folder, or a zip; Jerrick Cloud installs dependencies, injects PORT, starts the app, and serves it through a reverse proxy at http://<app>.localhost:8080.
+
+Answer questions about the user's own deployed apps: why one is failing, what its logs say, how much memory and CPU it is using, whether it is over its plan's memory cap, what its recent deploys and failed requests look like, and how the host machine is doing.
+
+Always call the tools for real data before answering — never guess a status, a number, or a log line. When an app is broken, name the most likely cause, quote the log line that shows it, and give the concrete fix (an env var to set, a Procfile web: line, a health check path, a bigger plan, a rollback to a named commit).
+
+Be brief and specific: a couple of sentences plus the evidence, not an essay. Environment variable values are deliberately hidden from you; you only ever see their names.
+
+You can propose exactly two actions — restart and redeploy — with request_restart and request_redeploy. Those tools never run anything: they put a Confirm button in front of the user, who decides. Propose one only when your diagnosis says it will actually help, say in one line what it will do and why, and never claim it has happened. Everything else (environment variables, plans, health check paths, custom domains, rollbacks) the user changes themselves — name the tab to do it in.`;
+
+// The assistant's tool surface: everything the dashboard can show, scoped to the apps this user may see.
+const assistantTools = visible => [
+  betaTool({
+    name: 'list_apps',
+    description: "List every app this user can see, with status, health, plan, URL, source and restart count. Call this first whenever the question isn't already about one named app.",
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    run: async () => JSON.stringify(visible().map(a => ({
+      name: a.name, status: a.status, health: a.health || 'unknown', plan: a.size || 'free',
+      url: a.url, source: a.source, port: a.port, restarts: a.restarts || 0,
+      startedAt: a.startedAt || null, createdAt: a.createdAt, domains: a.domains || [],
+    }))),
+  }),
+  betaTool({
+    name: 'app_diagnostics',
+    description: 'Everything known about one app: memory and CPU from the metric sampler, stored log counts, the last error, matching log lines, request volume / failure rate / latency through the proxy, recent failed requests, deploy history, and configuration (environment variable NAMES only). Use q and level to search the stored logs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'App name, exactly as returned by list_apps' },
+        q: { type: 'string', description: 'Optional substring to search the stored logs for, e.g. ECONNREFUSED or TypeError' },
+        level: { type: 'string', enum: ['all', 'error', 'warn', 'info'], description: 'Which log lines to return (default error)' },
+      },
+      required: ['name'],
+      additionalProperties: false,
+    },
+    run: async ({ name, q, level }) => {
+      const app = visible().find(a => a.name === name);
+      if (!app) return `No app named "${name}" — call list_apps for the names you can see.`;
+      const hist = appMetrics.get(app.name) || [];
+      const last = hist[hist.length - 1] || {}; // last sample, not a fresh probe: no interference with the CPU% baseline
+      return JSON.stringify({
+        ...insights(app, { q: q || '', level: level || 'error', limit: 40 }),
+        plan: app.size || 'free', planMemMb: planMem(app.size),
+        rss: last.rss ?? null, cpu: last.cpu ?? null, sampledAt: last.ts ?? null,
+        uptimeSec: app.startedAt && app.status === 'running' ? Math.round((Date.now() - new Date(app.startedAt)) / 1000) : 0,
+        source: app.source, url: app.url, port: app.port, runtime: app.runtime || null,
+        healthPath: app.healthPath || null, desired: app.desired,
+        envKeys: Object.keys(app.env || {}), // names only — values never leave this machine
+        deploys: (app.deploys || []).slice(-5), domains: app.domains || [],
+      });
+    },
+  }),
+  betaTool({
+    name: 'host_metrics',
+    description: 'Memory and disk usage of the machine hosting Jerrick Cloud, plus recent samples. Use for "is the server out of memory / disk" questions, or when several apps are unhealthy at once.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    run: async () => JSON.stringify({ ...metrics(), recent: metricHistory.slice(-20), alertPct: ALERT_PCT }),
+  }),
+];
+
+// The two actions the assistant may propose. Both are graceful — the running version keeps serving
+// until the new one is healthy — which is why they're safe to offer behind a single confirm click.
+const ACTIONS = {
+  restart: 'Restart the app process in place. Use for a hung, wedged, or memory-leaking app, or to pick up environment variables that were changed after it started.',
+  redeploy: 'Re-pull the source, reinstall dependencies, and start the new version. Use when the fix is in the code or in the dependencies rather than in the running process.',
+};
+// Write tools that write nothing: they record a proposal, the dashboard shows the user a Confirm
+// button, and confirming calls the same POST /api/apps/<name>/<action> route the toolbar already uses.
+// ponytail: one code path performs restarts and it's the one that already existed — this only asks.
+const actionTools = (visible, pending) => Object.entries(ACTIONS).map(([action, what]) => betaTool({
+  name: `request_${action}`,
+  description: `${what} This does NOT perform the ${action} — it puts a "Confirm ${action}" button in front of the user, who decides. Call it once you have diagnosed a problem this would fix.`,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'App name, exactly as returned by list_apps' },
+      reason: { type: 'string', description: 'One short line shown to the user next to the button, e.g. "wedged after 5 crash-loops"' },
+    },
+    required: ['name', 'reason'],
+    additionalProperties: false,
+  },
+  run: async ({ name, reason }) => {
+    const app = visible().find(a => a.name === name);
+    if (!app) return `No app named "${name}" — call list_apps for the names you can see.`;
+    if (!pending.some(p => p.name === name && p.action === action)) pending.push({ action, name, reason: String(reason).slice(0, 200) });
+    return `A "Confirm ${action}" button for "${name}" is now in front of the user. Nothing has run. Tell them in one line what it will do and why, and that it is their call. Do not request this again for this app.`;
+  },
+}));
+
+// Run one assistant turn: chat history in, answer + any actions awaiting confirmation out.
+// Tools resolve against `visible()` only, so the assistant can never reach someone else's app.
+async function askAssistant(messages, visible) {
+  const pending = [];
+  const reply = await llm().beta.messages.toolRunner({
+    model: ASSISTANT_MODEL,
+    max_tokens: 16000,
+    system: ASSISTANT_SYSTEM,
+    tools: [...assistantTools(visible), ...actionTools(visible, pending)],
+    messages,
+    max_iterations: 8, // bound the loop — this is a metered API
+  });
+  return { reply: reply.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim(), pending };
 }
 
 // Map an incoming Host header to an app name: an <app>.localhost subdomain, or a mapped custom domain.
@@ -832,8 +1013,24 @@ const handler = async (req, res) => {
   if (req.method === 'GET' && u.pathname === '/api/metrics') return json(res, metrics());
   if (req.method === 'GET' && u.pathname === '/api/metrics/history') return json(res, metricHistory);
 
+  // Assistant: chat history in, one answer out. Its tools only ever see apps this user may see.
+  if (req.method === 'POST' && u.pathname === '/api/assistant') {
+    if (!process.env.ANTHROPIC_API_KEY) return json(res, { error: 'Set ANTHROPIC_API_KEY in .env to turn the assistant on (ANTHROPIC_BASE_URL is optional).' }, 400);
+    const body = await readBody(req);
+    const messages = (Array.isArray(body.messages) ? body.messages : []).slice(-20)
+      .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+      .map(m => ({ role: m.role, content: m.content.slice(0, 20_000) }));
+    if (!messages.length) return json(res, { error: 'A question is required' }, 400);
+    try {
+      // { reply, pending } — pending actions are proposals; the user confirms them in the UI.
+      return json(res, await askAssistant(messages, () => apps.filter(a => canSee(a, req.user))));
+    } catch (e) {
+      return json(res, { error: `Assistant request failed: ${e.message}` }, 502);
+    }
+  }
+
   if (req.method === 'GET' && u.pathname === '/api/me') {
-    return json(res, AUTH_ON ? { auth: true, email: (req.user || {}).email, name: (req.user || {}).name } : { auth: false });
+    return json(res, { ...(AUTH_ON ? { auth: true, email: (req.user || {}).email, name: (req.user || {}).name } : { auth: false }), assistant: !!process.env.ANTHROPIC_API_KEY });
   }
 
   // API bearer token: issue (POST, revokes any prior) / check (GET). Needs Google sign-in to have a stable owner.
@@ -856,7 +1053,7 @@ const handler = async (req, res) => {
 
   if (parts[0] === 'api' && parts[1] === 'apps') {
     // When auth is on, a user sees/controls their own apps, apps shared with them, and legacy apps with no owner.
-    const mine = a => !AUTH_ON || !a.owner || (req.user && (a.owner === req.user.email || (a.collaborators || []).includes(req.user.email)));
+    const mine = a => canSee(a, req.user);
     if (req.method === 'GET' && parts.length === 2) return json(res, apps.filter(mine).map(publicApp));
 
     if (req.method === 'POST' && parts.length === 2) {
@@ -961,6 +1158,15 @@ const handler = async (req, res) => {
     if (req.method === 'DELETE' && parts[3] === 'domains' && parts.length === 5) {
       app.domains = (app.domains || []).filter(d => d !== decodeURIComponent(parts[4])); save();
       return json(res, publicApp(app));
+    }
+
+    // Application Insights: searchable stored logs + diagnostic values. ?q= substring, ?level=error|warn|info|all
+    if (req.method === 'GET' && parts[3] === 'insights' && parts.length === 4) {
+      return json(res, insights(app, {
+        q: u.searchParams.get('q') || '',
+        level: u.searchParams.get('level') || 'all',
+        limit: Math.min(1000, Number(u.searchParams.get('limit')) || 200),
+      }));
     }
 
     if (req.method === 'GET' && parts[3] === 'logs' && parts[4] === 'download') {
@@ -1108,10 +1314,44 @@ if (process.argv.includes('--check')) {
   assert.equal(_pa.env.K, 'v'); assert.equal(_pa.size, 'basic');
   // Docker image/container naming: slug-safe and stable.
   assert.equal(dockerImage('My App'), 'jc-my-app'); assert.equal(dockerName('My App', 3005), 'jc-my-app-3005');
+  // Insights log levels: errors and warnings are picked out of free-form app output; anything else is info.
+  assert.equal(levelOf('Error: connect ECONNREFUSED 127.0.0.1:5432'), 'error');
+  assert.equal(levelOf('Health check failed 3× — restarting unresponsive app'), 'error');
+  assert.equal(levelOf("TypeError: Cannot read properties of undefined (reading 'id')"), 'error');
+  assert.equal(levelOf('npm WARN deprecated request@2.88.2'), 'warn');
+  assert.equal(levelOf('Listening on port 3001'), 'info');
+  // Insights on an app with no log file / no traffic: zeroed, never throws.
+  const _ins = insights({ name: '__no_such_app__', status: 'stopped' });
+  assert.equal(_ins.lines, 0); assert.equal(_ins.counts.error, 0); assert.equal(_ins.lastError, null);
+  assert.equal(_ins.requests.total, 0); assert.equal(_ins.requests.avgMs, null); assert.deepEqual(_ins.results, []);
   // Collaborator email guard: accept a real address, reject junk.
   const emailOk = e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e);
   assert.ok(emailOk('a@b.com') && !emailOk('nope'));
-  findFreePort(PORT_BASE, new Set()).then(p => { assert.ok(p >= PORT_BASE); console.log('self-check OK'); process.exit(0); });
+  // App visibility: with sign-in off everyone sees everything; the rule the assistant's tools share.
+  assert.ok(canSee({ name: 'x' }, null));
+  assert.ok(canSee({ owner: 'a@b.com' }, { email: 'a@b.com' }));
+  // Assistant tool surface: three read-only tools, and env var VALUES never leave this machine.
+  const _visible = () => [{ name: 'demo', status: 'stopped', size: 'basic', env: encEnv({ SECRET_KEY: 'hunter2' }), deploys: [], domains: [] }];
+  const _tools = assistantTools(_visible);
+  assert.deepEqual(_tools.map(t => t.name), ['list_apps', 'app_diagnostics', 'host_metrics']);
+  // Action tools only ever propose: they record a pending action, dedupe it, and run nothing.
+  const _pending = [];
+  const _acts = actionTools(_visible, _pending);
+  assert.deepEqual(_acts.map(t => t.name), ['request_restart', 'request_redeploy']);
+  findFreePort(PORT_BASE, new Set()).then(async p => {
+    assert.ok(p >= PORT_BASE);
+    const diag = await _tools[1].run({ name: 'demo' });
+    assert.ok(!diag.includes('hunter2'), 'env values must never be sent to the model');
+    assert.deepEqual(JSON.parse(diag).envKeys, ['SECRET_KEY']);
+    assert.equal(JSON.parse(diag).planMemMb, 1024);
+    assert.ok((await _tools[1].run({ name: 'nope' })).startsWith('No app named'));
+    assert.ok(JSON.parse(await _tools[0].run({}))[0].name === 'demo');
+    await _acts[0].run({ name: 'demo', reason: 'wedged' });
+    await _acts[0].run({ name: 'demo', reason: 'wedged again' });          // same action+app -> no duplicate button
+    assert.ok((await _acts[0].run({ name: 'nope', reason: 'x' })).startsWith('No app named'));
+    assert.deepEqual(_pending, [{ action: 'restart', name: 'demo', reason: 'wedged' }]);
+    console.log('self-check OK'); process.exit(0);
+  });
 } else {
   fs.mkdirSync(LOG_DIR, { recursive: true });
   // Restore persisted logins, API tokens, and metric history so a restart is seamless.

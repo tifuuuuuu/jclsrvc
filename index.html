@@ -170,6 +170,8 @@
              line-height: 1.7; padding: 16px 18px; border-radius: var(--r); border: 1px solid var(--border);
              height: 60vh; overflow: auto; white-space: pre-wrap; }
   .console div { min-height: 1.25em; }
+  .console .lg-error { color: #ff9090; }
+  .console .lg-warn { color: #f3c165; }
 
   /* ---- metrics gauges ---- */
   .gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; margin-bottom: 18px; }
@@ -303,6 +305,7 @@
     <nav class="nav">
       <div class="nav-group">Overview</div>
       <div class="nav-item active" data-panel="overview"><svg viewBox="0 0 24 24"><path d="M3 3h8v8H3zm10 0h8v5h-8zm0 7h8v11h-8zM3 13h8v8H3z"/></svg>Overview</div>
+      <div class="nav-item" data-panel="assistant"><svg viewBox="0 0 24 24"><path d="M12 2 13.9 8.1 20 10l-6.1 1.9L12 18l-1.9-6.1L4 10l6.1-1.9zm6 12 .9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9z"/></svg>Assistant</div>
       <div class="nav-group">Deployment</div>
       <div class="nav-item" data-panel="deployment"><svg viewBox="0 0 24 24"><path d="M12 2 4 6v6c0 5 3.4 9.7 8 10 4.6-.3 8-5 8-10V6l-8-4z"/></svg>Deployment Center</div>
       <div class="nav-group">Settings</div>
@@ -312,6 +315,7 @@
       <div class="nav-group">Monitoring</div>
       <div class="nav-item" data-panel="metrics"><svg viewBox="0 0 24 24"><path d="M4 20V10h4v10zm6 0V4h4v16zm6 0v-7h4v7z"/></svg>Metrics</div>
       <div class="nav-item" data-panel="logstream"><svg viewBox="0 0 24 24"><path d="M4 5h16v3H4zm0 5h16v3H4zm0 5h10v3H4z"/></svg>Log stream</div>
+      <div class="nav-item" data-panel="insights"><svg viewBox="0 0 24 24"><path d="M10 2a8 8 0 1 0 4.9 14.3l4.4 4.4 1.4-1.4-4.4-4.4A8 8 0 0 0 10 2zm0 2a6 6 0 1 1 0 12 6 6 0 0 1 0-12zm-1 3v4l3 2 .8-1.3L10.5 10V7z"/></svg>Application Insights</div>
       <div class="nav-group">Development tools</div>
       <div class="nav-item" data-panel="shell"><svg viewBox="0 0 24 24"><path d="M3 3h18v18H3zm2 4v12h14V7zm2 2 3 3-3 3v-2l1-1-1-1zm5 4h4v2h-4z"/></svg>Console (SSH)</div>
     </nav>
@@ -335,6 +339,20 @@
           </div>
         </div>
         <div class="info-bar">Jerrick Cloud installs dependencies then starts your app with <b class="mono">PORT</b> injected. Your app must listen on <b class="mono">process.env.PORT</b>. Watch it happen live under <a onclick="selectPanel('logstream')">Log stream</a>.</div>
+      </section>
+
+      <!-- Assistant: asks Claude, which reads your live apps / metrics / logs before answering -->
+      <section class="panel" id="p-assistant">
+        <h2 class="blade-h">Assistant</h2>
+        <p class="desc">Ask about any of your apps — <i>why did protein-left stop?</i>, <i>which app is using the most memory?</i>, <i>what's in hello-web's error logs?</i> It reads your live status, metrics, deploy history, and stored logs before answering. Read-only: it tells you what to change, it doesn't press the buttons.</p>
+        <div class="card">
+          <div class="console" id="ai-log" style="height:44vh"></div>
+          <form onsubmit="askAI(event)" style="display:flex;gap:8px;margin-top:10px">
+            <input id="ai-input" class="inp" autocomplete="off" placeholder="Why is my app returning 502?" style="flex:1">
+            <button class="btn primary" id="ai-send" type="submit">Ask</button>
+          </form>
+          <div class="muted" id="ai-hint" style="margin-top:8px"></div>
+        </div>
       </section>
 
       <!-- Deployment Center -->
@@ -385,6 +403,15 @@
             <button class="btn primary" onclick="saveEnv()">Save</button>
             <span class="muted" id="env-msg"></span>
           </div>
+          <details style="margin-top:16px">
+            <summary style="cursor:pointer" class="muted">Bulk import from .env or localSettings.json</summary>
+            <p class="desc" style="margin:8px 0">Paste a <span class="mono">.env</span> file (<span class="mono">KEY=value</span> lines) or an Azure <span class="mono">localSettings.json</span>. Variables are added to the list above — review, then Save.</p>
+            <textarea id="env-bulk" class="inp mono" rows="6" spellcheck="false" placeholder="API_KEY=abc123&#10;DB_URL=postgres://…&#10;&#10;— or —&#10;{ &quot;Values&quot;: { &quot;API_KEY&quot;: &quot;abc123&quot; } }" style="width:100%; resize:vertical"></textarea>
+            <div style="margin-top:8px; display:flex; gap:12px; align-items:center">
+              <button class="btn" onclick="importEnv()">Import</button>
+              <span class="muted" id="env-bulk-msg"></span>
+            </div>
+          </details>
           <p class="desc" style="margin-top:12px">🔒 Values are encrypted at rest in <span class="mono">apps.json</span>.</p>
         </div>
 
@@ -488,6 +515,51 @@
         <div class="console" id="console"></div>
       </section>
 
+      <!-- Application Insights: search the stored logs + the values to check when something breaks -->
+      <section class="panel" id="p-insights">
+        <h2 class="blade-h">Application Insights</h2>
+        <p class="desc">Every line your app writes is stored on the server and kept across restarts. Search it here, and check the values below when something looks wrong.</p>
+        <div class="card" style="padding:14px 18px; margin-bottom:16px">
+          <div class="essentials">
+            <div class="kv"><span class="k">Stored log lines</span><span class="v mono" id="ins-lines">—</span></div>
+            <div class="kv"><span class="k">Errors logged</span><span class="v mono" id="ins-errors">—</span></div>
+            <div class="kv"><span class="k">Warnings logged</span><span class="v mono" id="ins-warns">—</span></div>
+            <div class="kv"><span class="k">Restarts</span><span class="v mono" id="ins-restarts">—</span></div>
+            <div class="kv"><span class="k">Requests seen</span><span class="v mono" id="ins-reqs">—</span></div>
+            <div class="kv"><span class="k">Failed requests</span><span class="v mono" id="ins-fails">—</span></div>
+            <div class="kv"><span class="k">Response time avg / p95</span><span class="v mono" id="ins-lat">—</span></div>
+            <div class="kv"><span class="k">Peak memory / CPU</span><span class="v mono" id="ins-peak">—</span></div>
+          </div>
+          <div class="err" id="ins-last" style="margin-top:12px; overflow-wrap:anywhere"></div>
+        </div>
+
+        <div class="card" style="margin-bottom:16px">
+          <h3>Search logs</h3>
+          <p class="desc" style="margin-bottom:10px">Substring match across everything stored for this app — newest matches first.</p>
+          <div style="display:flex; gap:8px; flex-wrap:wrap">
+            <input id="ins-q" class="inp mono" placeholder="e.g. ECONNREFUSED, TypeError, /api/orders" style="flex:1; min-width:220px" onkeydown="if(event.key==='Enter')loadInsights()">
+            <select id="ins-level" class="inp" onchange="loadInsights()">
+              <option value="all">All levels</option>
+              <option value="error">Errors</option>
+              <option value="warn">Warnings</option>
+              <option value="info">Info</option>
+            </select>
+            <button class="btn primary" onclick="loadInsights()">Search</button>
+            <a class="btn" id="ins-dl" target="_blank">⬇ Download all</a>
+          </div>
+          <div class="muted" id="ins-count" style="margin-top:8px"></div>
+          <div class="console" id="ins-out" style="height:34vh; margin-top:10px"></div>
+        </div>
+
+        <div class="card">
+          <h3>Failed requests</h3>
+          <p class="desc" style="margin-bottom:10px">Requests through the Jerrick Cloud proxy that returned 4xx / 5xx, newest first. Collected while the server has been up.</p>
+          <div class="tbl-wrap">
+            <table><thead><tr><th>When</th><th>Status</th><th>Method</th><th>Path</th><th>Time</th></tr></thead><tbody id="ins-fail-tbody"></tbody></table>
+          </div>
+        </div>
+      </section>
+
       <!-- Console (one-shot exec in the app's working dir) -->
       <section class="panel" id="p-shell">
         <h2 class="blade-h">Console</h2>
@@ -570,6 +642,7 @@
 
   // ---------- auth (avatar shows the signed-in Google user; click to sign out) ----------
   fetch('/api/me').then(r => r.json()).then(m => {
+    if (!m.assistant) $('#ai-hint').textContent = 'Assistant is off — add ANTHROPIC_API_KEY to .env (ANTHROPIC_BASE_URL optional) and restart the server.';
     AUTH = !!m.auth;                   // gates the sharing + API-token cards (owners only exist with sign-in)
     if (!m.auth || !m.email) return;   // login disabled -> keep the static avatar
     const el = $('#me'); if (!el) return;
@@ -783,6 +856,37 @@
     if (currentApp) currentApp.env = j.env || env;
     $('#env-msg').textContent = 'Saved — applies on next start / restart.';
   }
+  // Parse pasted .env (KEY=value lines) or localSettings.json (.Values, or a plain {KEY:val}) -> { KEY: value }.
+  function parseBulkEnv(text) {
+    const t = (text || '').trim();
+    if (!t) return {};
+    if (t[0] === '{') { // JSON: Azure localSettings.json has a .Values map; else treat the object itself as the map
+      try {
+        const o = JSON.parse(t), src = (o && typeof o.Values === 'object' && o.Values) ? o.Values : o, out = {};
+        for (const [k, v] of Object.entries(src)) if (v == null || typeof v !== 'object') out[k] = String(v);
+        return out;
+      } catch (_) {} // not valid JSON -> fall through to .env line parsing
+    }
+    const out = {};
+    for (const line of t.split(/\r?\n/)) {
+      const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/); // KEY=val, optional `export `
+      if (m) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, ''); // strip surrounding quotes
+    }
+    return out;
+  }
+  function importEnv() {
+    const parsed = parseBulkEnv($('#env-bulk').value), n = Object.keys(parsed).length;
+    if (!n) { $('#env-bulk-msg').textContent = 'Nothing recognized — expected KEY=value lines or JSON.'; return; }
+    const cur = {}; // merge into current rows; parsed values win on conflict
+    document.querySelectorAll('#env-rows .kvrow').forEach(row => {
+      const k = row.querySelector('.env-k').value.trim();
+      if (k) cur[k] = row.querySelector('.env-v').value;
+    });
+    Object.assign(cur, parsed);
+    $('#env-rows').innerHTML = Object.keys(cur).map(k => envRow(k, cur[k])).join('');
+    $('#env-bulk').value = '';
+    $('#env-bulk-msg').textContent = `Imported ${n} variable${n > 1 ? 's' : ''} — review, then Save.`;
+  }
 
   // ---- custom domains ----
   function renderDomains(a) {
@@ -935,6 +1039,112 @@
     if (atBottom) c.scrollTop = c.scrollHeight;
   }
 
+  // ---------- assistant (Claude, with read-only tools over your apps / metrics / logs) ----------
+  let aiMsgs = [];
+  function aiPrint(text, cls) {
+    const log = $('#ai-log');
+    const div = document.createElement('div');
+    div.textContent = text;
+    if (cls) div.className = cls;
+    div.style.marginBottom = '10px';
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+    return div;
+  }
+  // The assistant proposes; you decide. Confirming calls the same endpoint the toolbar buttons do.
+  function aiConfirm(p) {
+    const log = $('#ai-log');
+    const row = document.createElement('div');
+    row.style.cssText = 'margin:2px 0 14px; padding:10px 12px; border:1px solid #2a3446; border-radius:9px; background:#111826; display:flex; gap:10px; align-items:center; flex-wrap:wrap';
+    const label = document.createElement('span');
+    label.style.flex = '1';
+    label.textContent = `${p.action === 'restart' ? '🔁' : '⬆'} ${p.action} ${p.name} — ${p.reason}`;
+    const yes = document.createElement('button');
+    yes.className = 'btn primary'; yes.style.height = '32px'; yes.textContent = 'Confirm';
+    const no = document.createElement('button');
+    no.className = 'btn'; no.style.height = '32px'; no.textContent = 'Dismiss';
+    no.onclick = () => { row.remove(); aiMsgs.push({ role: 'user', content: `(I dismissed the ${p.action} of ${p.name}.)` }); };
+    yes.onclick = async () => {
+      yes.disabled = no.disabled = true; yes.textContent = 'Confirming…';
+      try {
+        const r = await api(`/${p.name}/${p.action}`, { method: 'POST' });
+        row.remove();
+        aiPrint(r.error ? `${p.action} failed: ${r.error}` : `✓ ${p.action} of ${p.name} started — watch it in Log stream.`, r.error ? 'lg-error' : 'lg-warn');
+        aiMsgs.push({ role: 'user', content: `(I confirmed the ${p.action} of ${p.name}${r.error ? `, it failed: ${r.error}` : '; it is running now'}.)` });
+        if (currentName === p.name) refresh();
+      } catch (_) {
+        yes.disabled = no.disabled = false; yes.textContent = 'Confirm';
+        aiPrint(`${p.action} request failed`, 'lg-error');
+      }
+    };
+    row.append(label, yes, no);
+    log.appendChild(row);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  async function askAI(e) {
+    e.preventDefault();
+    const inp = $('#ai-input'), q = inp.value.trim();
+    if (!q) return;
+    aiMsgs.push({ role: 'user', content: q });
+    aiPrint('› ' + q, 'lg-warn');
+    inp.value = ''; inp.disabled = true; $('#ai-send').disabled = true;
+    const pending = aiPrint('Reading your apps…', 'muted');
+    try {
+      const r = await fetch('/api/assistant', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: aiMsgs }),
+      }).then(r => r.json());
+      pending.remove();
+      if (r.error) aiPrint(r.error, 'lg-error');
+      else {
+        aiMsgs.push({ role: 'assistant', content: r.reply });
+        aiPrint(r.reply);
+        (r.pending || []).forEach(aiConfirm); // proposed actions — nothing has run yet
+      }
+    } catch (_) { pending.remove(); aiPrint('Request failed', 'lg-error'); }
+    inp.disabled = false; $('#ai-send').disabled = false; inp.focus();
+  }
+
+  // ---------- application insights (search the stored logs + the diagnostic values) ----------
+  async function loadInsights() {
+    if (!currentName) return;
+    const q = $('#ins-q').value.trim(), level = $('#ins-level').value;
+    $('#ins-dl').href = `/api/apps/${currentName}/logs/download`;
+    let d;
+    try { d = await fetch(`/api/apps/${currentName}/insights?level=${level}&q=${encodeURIComponent(q)}`).then(r => r.json()); } catch (_) { return; }
+    if (d.error) return;
+    const r = d.requests;
+    $('#ins-lines').textContent = d.lines;
+    $('#ins-errors').innerHTML = d.counts.error ? `<span class="health-bad">${d.counts.error}</span>` : '0';
+    $('#ins-warns').textContent = d.counts.warn;
+    $('#ins-restarts').textContent = d.restarts;
+    $('#ins-reqs').textContent = r.total;
+    $('#ins-fails').innerHTML = r.failed ? `<span class="health-bad">${r.failed} server</span>` : '0 server';
+    $('#ins-fails').innerHTML += ` · ${r.clientErrors} client`;
+    $('#ins-lat').textContent = r.avgMs == null ? '—' : `${r.avgMs} ms / ${r.p95Ms} ms`;
+    $('#ins-peak').textContent = d.peakRss ? `${fmtBytes(d.peakRss)} / ${d.peakCpu ?? 0}%` : '—';
+    $('#ins-last').textContent = d.lastError ? 'Last error: ' + d.lastError : '';
+
+    $('#ins-count').textContent = d.lines
+      ? `${d.matched} matching line${d.matched === 1 ? '' : 's'} of ${d.lines} stored`
+      : 'Nothing logged for this app yet.';
+    const out = $('#ins-out');
+    out.innerHTML = '';
+    for (const l of d.results) {
+      const div = document.createElement('div');
+      div.textContent = l.text;
+      if (l.level !== 'info') div.className = 'lg-' + l.level;
+      out.appendChild(div);
+    }
+    $('#ins-fail-tbody').innerHTML = r.failures.length ? r.failures.map(f => `<tr>
+        <td>${new Date(f.ts).toLocaleTimeString()}</td>
+        <td><span class="${f.status >= 500 ? 'health-bad' : 'health-unknown'}">${f.status}</span></td>
+        <td class="mono">${esc(f.method)}</td><td class="mono">${esc(f.path)}</td><td class="mono">${f.ms} ms</td>
+      </tr>`).join('')
+      : '<tr><td colspan="5" class="muted">No failed requests recorded.</td></tr>';
+  }
+
   // ---------- panels ----------
   function selectPanel(panel) {
     document.querySelectorAll('#screen-app .nav-item').forEach(n => n.classList.toggle('active', n.dataset.panel === panel));
@@ -942,6 +1152,8 @@
     const el = document.getElementById('p-' + panel);
     if (el) el.classList.add('active');
     if (panel === 'metrics') startMetrics(); else stopMetrics();
+    if (panel === 'insights') loadInsights();
+    if (panel === 'assistant') $('#ai-input').focus();
     if (panel === 'shell') $('#shell-input').focus();
   }
   document.addEventListener('click', e => {

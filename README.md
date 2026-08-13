@@ -1,6 +1,6 @@
 # Jerrick Cloud
 
-A tiny, zero-dependency deploy platform for your own machine — an Azure App Service / Heroku you host at home. Give it a Git URL, a local folder, or a `.zip`; it detects the runtime (Node / Python / .NET / Docker / any `Procfile`), installs deps, and runs the app on a free port behind a reverse proxy at `http://<app>.localhost:8080`.
+A tiny deploy platform for your own machine — an Azure App Service / Heroku you host at home. Give it a Git URL, a local folder, or a `.zip`; it detects the runtime (Node / Python / .NET / Docker / any `Procfile`), installs deps, and runs the app on a free port behind a reverse proxy at `http://<app>.localhost:8080`.
 
 ```bash
 node server.js            # http://localhost:8080
@@ -28,6 +28,8 @@ node server.js --check    # run the self-checks
 - **API tokens** — issue a Bearer token (Configuration tab) and drive the API from a CLI / CI with `Authorization: Bearer <token>`.
 
 **Monitoring**
+- **Assistant tab** — ask Claude about your apps in plain language (*why did protein-left stop?*, *which app is using the most memory?*). It calls read-only tools over your live status, per-app memory/CPU, deploy history, host metrics, and stored logs before answering, so it quotes the actual error line and names the fix. Scoped to the apps you can see; environment variable **names** are visible to it, values never are. It can **propose** a restart or redeploy when its diagnosis calls for one — that only puts a Confirm button in the chat, which runs the same action the toolbar does; nothing happens until you click it. Everything else it explains and points you at the right tab. Set `ANTHROPIC_API_KEY` to turn it on.
+- **Application Insights tab** — everything the app has logged is stored on disk (`logs/<app>.log`, survives restarts) and searchable here: substring search, filter by error / warning / info, and the values to check when something breaks — errors and warnings logged, last error, restarts, requests seen, failed requests, avg + p95 response time, peak memory / CPU, and a table of recent 4xx/5xx requests through the proxy. Full log downloadable.
 - **Metrics tab** — this app's process memory / CPU / uptime / restarts / health, plus live host memory & disk with sparklines and a sample log. Per-app history is sampled and persisted.
 - **Threshold alerts** — emails when host memory or disk crosses 85% (set `ALERT_PCT` to change). Reuses the SMTP config below.
 
@@ -47,6 +49,9 @@ node server.js --check    # run the self-checks
 | `SSL_CERT` / `SSL_KEY` | Paths to a cert/key pair → serve over HTTPS. |
 | `JC_SECRET` | Key for env-var-at-rest encryption. Unset → a random key is generated and stored in `logs/.secret`. |
 | `MONGODB_URI` | First-login user persistence (MongoDB — a connection string; db name optional in the URI). |
+| `ANTHROPIC_API_KEY` | Turns the Assistant tab on. Unset → the assistant is off, everything else runs. |
+| `ANTHROPIC_BASE_URL` | Optional endpoint override — point it at a gateway/proxy instead of `api.anthropic.com`. |
+| `ANTHROPIC_MODEL` | Optional model override (default `claude-opus-5`). |
 
 ## Reaching it from other devices
 
