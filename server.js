@@ -240,6 +240,25 @@ function activity(user, limit = 200) {
 }
 
 // ---- per-app access restrictions (enforced at the proxy, before anything reaches the app) ----
+// Requests per client IP per app, in a fixed 60s window, enforced with the other proxy gates below.
+// The README recommends fronting this box with a tunnel, which makes an app reachable by anything on
+// the internet — one runaway caller is then enough to keep a home machine busy. 0 / unset = off.
+// ponytail: fixed window, so a caller can burst 2x across a boundary, and the counters live in memory
+//   (a restart forgives everyone). Enough to stop a loop hammering an app; not a DDoS defence.
+const RATE_WINDOW = 60_000;
+const rateHits = new Map();   // "<app>|<ip>" -> { n, resetAt }
+const clampInt = (v, max) => Math.max(0, Math.min(max, Math.round(Number(v) || 0)));
+// 0 = let it through; otherwise the seconds left in this window (used as Retry-After).
+function rateExceeded(app, ip) {
+  const max = app.rateLimit || 0;
+  if (!max) return 0;
+  const now = Date.now(), key = app.name + '|' + ip;
+  let h = rateHits.get(key);
+  if (!h || now >= h.resetAt) { h = { n: 0, resetAt: now + RATE_WINDOW }; rateHits.set(key, h); }
+  h.n++;
+  if (rateHits.size > 10_000) for (const [k, v] of rateHits) if (v.resetAt <= now) rateHits.delete(k); // drop dead windows
+  return h.n > max ? Math.ceil((h.resetAt - now) / 1000) : 0;
+}
 // The platform listens on every interface, so without this every app is open to the LAN and to any
 // tunnel pointed at it. Two independent gates, both optional: an IP allow list and a password.
 // ponytail: allow-list entries are an exact IP or a prefix ending in "." / ":" ("192.168.1.") — no CIDR math.
@@ -253,6 +272,8 @@ const sameSecret = (a, b) => {
 };
 // null = let it through; otherwise the response to send instead (401 challenge / 403).
 function accessDenied(app, req) {
+  const wait = rateExceeded(app, ipOf(req)); // outermost gate: cheapest, and it shields the password compare
+  if (wait) return { code: 429, headers: { 'Retry-After': String(wait) }, body: `Too many requests — try again in ${wait}s.` };
   if (!ipAllowed(app.allowIps, ipOf(req)))
     return { code: 403, body: 'Forbidden — your address is not on this app\'s allow list.' };
   const pass = app.accessPassword ? decVal(app.accessPassword) : '';
@@ -473,9 +494,14 @@ function applyManifest(app, cwd) {
     applied.push(`health check ${p || 'off'}`);
   }
   if ('idleMin' in m) {
-    const n = Math.max(0, Math.min(1440, Math.round(Number(m.idleMin) || 0)));
+    const n = clampInt(m.idleMin, 1440);
     app.idleMin = n || undefined;
     applied.push(`idle sleep ${n ? n + ' min' : 'off'}`);
+  }
+  if ('rateLimit' in m) {
+    const n = clampInt(m.rateLimit, 100_000);
+    app.rateLimit = n || undefined;
+    applied.push(`rate limit ${n ? n + '/min per IP' : 'off'}`);
   }
   if ('jobs' in m) {
     const jobs = (Array.isArray(m.jobs) ? m.jobs : []).slice(0, 20)
@@ -1545,8 +1571,9 @@ const handler = async (req, res) => {
         if (bad) return json(res, { error: `"${bad}" is not an IP address or prefix` }, 400);
         app.allowIps = list;
       }
+      if ('rateLimit' in body) app.rateLimit = clampInt(body.rateLimit, 100_000) || undefined;
       if ('idleMin' in body) {
-        const n = Math.max(0, Math.min(1440, Math.round(Number(body.idleMin) || 0)));
+        const n = clampInt(body.idleMin, 1440);
         app.idleMin = n || undefined;
         if (!n && app.sleeping) { app.sleeping = false; startApp(app); } // idle sleep off → bring it back up
       }
@@ -1822,6 +1849,15 @@ if (process.argv.includes('--check')) {
   assert.equal(accessDenied(_locked, _basic('wrong')).code, 401);
   assert.equal(accessDenied(_locked, _basic('hunter2')), null);
   assert.equal(accessDenied({ name: 'a', allowIps: ['10.0.0.1'] }, _basic('')).code, 403);
+  // Proxy rate limit: off unless set, budgeted per client IP, and refused only past the ceiling.
+  assert.equal(rateExceeded({ name: '__rate_off__' }, '1.2.3.4'), 0);          // unset -> never limits
+  const _rl = { name: '__rate_test__', rateLimit: 3 };
+  assert.deepEqual([1, 2, 3].map(() => rateExceeded(_rl, '1.2.3.4')), [0, 0, 0]);
+  assert.ok(rateExceeded(_rl, '1.2.3.4') > 0);                                 // the 4th in the window waits
+  assert.equal(rateExceeded(_rl, '5.6.7.8'), 0);                               // another caller has its own budget
+  // ...and it is the first gate accessDenied applies, so the WebSocket path is covered by the same call.
+  assert.equal(accessDenied(_rl, { headers: {}, socket: { remoteAddress: '1.2.3.4' } }).code, 429);
+  assert.equal(clampInt('7', 100), 7); assert.equal(clampInt(-5, 100), 0); assert.equal(clampInt(1e9, 100), 100);
   // Cron: field expansion, then whole-expression matching against a real Date.
   assert.deepEqual([...cronField('*/15', 0, 59)], [0, 15, 30, 45]);
   assert.deepEqual([...cronField('5', 0, 59)], [5]);

@@ -473,7 +473,7 @@
 
         <div class="card" style="max-width:720px; margin-top:16px">
           <h3>Access restrictions</h3>
-          <p class="desc" style="margin-bottom:10px">Applied at the proxy, before a request reaches your app — so they cover the subdomain, custom domains, and WebSockets alike. Leave both blank to keep the app public. Takes effect immediately.</p>
+          <p class="desc" style="margin-bottom:10px">Applied at the proxy, before a request reaches your app — so they cover the subdomain, custom domains, and WebSockets alike. Leave them blank to keep the app open. Takes effect immediately.</p>
           <div class="kvrow" style="align-items:center">
             <span class="k" style="width:150px">Password</span>
             <input id="acc-pass" class="inp" type="password" placeholder="(none — app is public)" style="flex:1" autocomplete="new-password">
@@ -484,6 +484,12 @@
             <textarea id="acc-ips" class="inp mono" rows="2" spellcheck="false" placeholder="127.0.0.1&#10;192.168.1." style="flex:1; resize:vertical"></textarea>
           </div>
           <p class="desc" style="margin:6px 0 0">One per line — an exact address, or a prefix ending in a dot (<span class="mono">192.168.1.</span> = that whole subnet). Blank = any address.</p>
+          <div class="kvrow" style="align-items:center; margin-top:14px">
+            <span class="k" style="width:150px">Rate limit</span>
+            <input id="acc-rate" class="inp mono" type="number" min="0" step="10" placeholder="0" style="width:110px">
+            <span class="muted" style="margin-left:10px">requests / minute, per visitor IP</span>
+          </div>
+          <p class="desc" style="margin:6px 0 0">Anything over gets <span class="mono">429</span> until the minute rolls. 0 = unlimited. Worth setting on anything you expose through a tunnel.</p>
           <div style="margin-top:14px; display:flex; gap:12px; align-items:center">
             <button class="btn primary" onclick="saveAccess()">Save</button>
             <span class="muted" id="acc-msg"></span>
@@ -882,13 +888,15 @@
     $('#acc-pass').value = '';
     $('#acc-pass').placeholder = a.hasPassword ? '(password set — type to replace, clear to remove)' : '(none — app is public)';
     $('#acc-ips').value = (a.allowIps || []).join('\n');
+    $('#acc-rate').value = a.rateLimit || '';
     $('#acc-msg').textContent = '';
   }
   async function saveAccess() {
-    const j = await saveSettings({ password: $('#acc-pass').value, allowIps: $('#acc-ips').value }, '#acc-msg');
+    const j = await saveSettings({ password: $('#acc-pass').value, allowIps: $('#acc-ips').value,
+      rateLimit: Number($('#acc-rate').value) || 0 }, '#acc-msg');
     if (j.error) return;
     renderAccess(j); // re-render clears the message, so say it again afterwards
-    $('#acc-msg').textContent = j.hasPassword || (j.allowIps || []).length ? 'Saved — this app is now restricted.' : 'Saved — this app is public.';
+    $('#acc-msg').textContent = j.hasPassword || (j.allowIps || []).length || j.rateLimit ? 'Saved — this app is now restricted.' : 'Saved — this app is public.';
   }
   async function saveIdle() { await saveSettings({ idleMin: Number($('#idle-min').value) || 0 }, '#idle-msg'); }
 
