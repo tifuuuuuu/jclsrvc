@@ -291,6 +291,25 @@
     </div>
 
     <div id="apps-grid" class="apps-grid"></div>
+
+    <details class="card" id="iam-card" style="margin-top:22px; display:none">
+      <summary style="cursor:pointer; font-weight:650">Access control (IAM)</summary>
+      <p class="desc" style="margin:10px 0">Roles apply to this whole subscription — every app in Jerrick Cloud — unlike per-app Sharing, which grants one app.
+        <b>Owner</b> controls everything and hands out roles. <b>Contributor</b> controls every app but cannot change access.
+        <b>User Access Administrator</b> hands out roles and reads apps, but changes none.</p>
+      <div class="muted" id="iam-org" style="margin-bottom:12px"></div>
+      <div id="iam-add" style="display:none; gap:8px; margin-bottom:10px">
+        <input id="iam-email" class="inp" placeholder="teammate@yourcompany.com" style="flex:1" onkeydown="if(event.key==='Enter')addRole()">
+        <select id="iam-role" class="inp" style="width:210px">
+          <option value="contributor">Contributor</option>
+          <option value="useradmin">User Access Administrator</option>
+          <option value="owner">Owner</option>
+        </select>
+        <button class="btn primary" onclick="addRole()">Add</button>
+      </div>
+      <div class="err" id="iam-err"></div>
+      <div id="iam-list"></div>
+    </details>
   </div>
 </div>
 
@@ -568,6 +587,11 @@
       <section class="panel" id="p-insights">
         <h2 class="blade-h">Application Insights</h2>
         <p class="desc">Every line your app writes is stored on the server and kept across restarts. Search it here, and check the values below when something looks wrong.</p>
+        <div class="card" id="ins-diag" style="display:none; padding:14px 18px; margin-bottom:16px; border-left:3px solid var(--bad)">
+          <h3>Why it failed</h3>
+          <p class="desc" style="margin-bottom:10px" id="ins-diag-when"></p>
+          <div id="ins-diag-text" style="white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.55"></div>
+        </div>
         <div class="card" style="padding:14px 18px; margin-bottom:16px">
           <div class="essentials">
             <div class="kv"><span class="k">Stored log lines</span><span class="v mono" id="ins-lines">—</span></div>
@@ -694,8 +718,9 @@
     if (!m.assistant) $('#ai-hint').textContent = 'Assistant is off — add ANTHROPIC_API_KEY to .env (ANTHROPIC_BASE_URL optional) and restart the server.';
     AUTH = !!m.auth;                   // gates the sharing + API-token cards (owners only exist with sign-in)
     if (!m.auth || !m.email) return;   // login disabled -> keep the static avatar
+    loadRoles();                       // subscription roles need sign-in too
     const el = $('#me'); if (!el) return;
-    el.title = `${m.email} — click to sign out`;
+    el.title = `${m.email}${m.roleName ? ' · ' + m.roleName : ''} — click to sign out`;
     el.textContent = (m.email[0] || '?').toUpperCase();
     el.style.cursor = 'pointer';
     el.onclick = () => { if (confirm('Sign out of Jerrick Cloud?')) location.href = '/auth/logout'; };
@@ -913,6 +938,38 @@
   async function removeShare(email) {
     const r = await fetch(`/api/apps/${currentName}/collaborators/${encodeURIComponent(email)}`, { method: 'DELETE' });
     const j = await r.json(); currentApp = j; renderShare(j);
+  }
+
+  // ---- subscription access control (IAM) ----
+  // Everyone signed in sees who holds what; only an Owner / User Access Administrator gets the controls.
+  async function loadRoles() {
+    const d = await fetch('/api/roles').then(r => r.json()).catch(() => ({ error: 'x' }));
+    if (d.error) return;
+    $('#iam-card').style.display = '';
+    $('#iam-org').innerHTML = d.org
+      ? `Organisation <b class="mono">@${esc(d.org)}</b> · Subscription owner <b class="mono">${esc(d.owner || '—')}</b>. Roles can only be granted to <span class="mono">@${esc(d.org)}</span> addresses.`
+      : 'No organisation domain yet — sign in to claim this subscription.';
+    $('#iam-add').style.display = d.canAssign ? 'flex' : 'none';
+    $('#iam-list').innerHTML = d.assignments.length
+      ? d.assignments.map(a => `<div class="kvrow"><span class="mono" style="flex:1">${esc(a.email)}</span>
+          <span class="muted" style="margin-right:10px">${esc(a.name)}</span>
+          ${d.canAssign ? `<button class="rm" onclick="removeRole('${esc(a.email)}')">✕</button>` : ''}</div>`).join('')
+      : '<span class="muted">No role assignments yet.</span>';
+    $('#iam-err').textContent = '';
+  }
+  async function addRole() {
+    const email = $('#iam-email').value.trim();
+    if (!email) return;
+    const r = await fetch('/api/roles', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, role: $('#iam-role').value }) });
+    const j = await r.json();
+    if (j.error) { $('#iam-err').textContent = j.error; return; }
+    $('#iam-email').value = ''; loadRoles();
+  }
+  async function removeRole(email) {
+    const j = await fetch('/api/roles/' + encodeURIComponent(email), { method: 'DELETE' }).then(r => r.json());
+    if (j.error) { $('#iam-err').textContent = j.error; return; }
+    loadRoles();
   }
 
   // ---- API token ----
@@ -1236,6 +1293,12 @@
     $('#ins-lat').textContent = r.avgMs == null ? '—' : `${r.avgMs} ms / ${r.p95Ms} ms`;
     $('#ins-peak').textContent = d.peakRss ? `${fmtBytes(d.peakRss)} / ${d.peakCpu ?? 0}%` : '—';
     $('#ins-last').textContent = d.lastError ? 'Last error: ' + d.lastError : '';
+    // Root cause the assistant wrote by itself when the app failed. Cleared as soon as it runs again.
+    $('#ins-diag').style.display = d.diagnosis ? '' : 'none';
+    if (d.diagnosis) {
+      $('#ins-diag-text').textContent = d.diagnosis.text;
+      $('#ins-diag-when').textContent = 'Written automatically when this app failed, ' + new Date(d.diagnosis.at).toLocaleString() + '.';
+    }
 
     $('#ins-count').textContent = d.lines
       ? `${d.matched} matching line${d.matched === 1 ? '' : 's'} of ${d.lines} stored`

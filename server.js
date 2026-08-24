@@ -39,6 +39,7 @@ const PROTO = SSL ? 'https' : 'http';
 // ---- feature config (all fit the zero-dep, single-user, home-server design) ----
 const SESS_FILE = path.join(LOG_DIR, 'sessions.json');   // persisted logins (survive a server restart)
 const TOKENS_FILE = path.join(LOG_DIR, 'tokens.json');   // API bearer token -> owner email
+const ROLES_FILE = path.join(LOG_DIR, 'roles.json');     // subscription role assignments: email -> role
 const METRICS_FILE = path.join(LOG_DIR, 'metrics.json'); // persisted host + per-app metric history
 const SECRET_FILE = path.join(LOG_DIR, '.secret');       // 32-byte key for env-var-at-rest encryption
 const APP_METRIC_HISTORY = 240;                          // per-app samples kept (~1h at 15s)
@@ -175,9 +176,36 @@ const decEnv = e => Object.fromEntries(Object.entries(e || {}).map(([k, v]) => [
 // App object for API responses: env decrypted for display, the access password replaced by a boolean
 // (it protects the app itself — the portal never needs the value back), everything else untouched.
 const publicApp = a => ({ ...a, env: decEnv(a.env), accessPassword: undefined, hasPassword: !!a.accessPassword });
-// Who may see an app: with sign-in off, everyone; otherwise its owner, its collaborators, and
-// legacy apps that predate owners. Single rule for the apps API and the assistant's tools alike.
-const canSee = (a, user) => !AUTH_ON || !a.owner || !!(user && (a.owner === user.email || (a.collaborators || []).includes(user.email)));
+// ---- subscription roles (Azure's three built-ins, same split of powers) ----
+// Scope is the whole subscription — this Jerrick Cloud instance — which is what makes them different
+// from an app's own owner/collaborators (that's resource-level access, and it still applies).
+//   owner        full control over every app, and hands out roles
+//   contributor  full control over every app, cannot touch role assignments
+//   useradmin    hands out roles, read-only over apps (Azure's User Access Administrator)
+const ROLES = { owner: 'Owner', contributor: 'Contributor', useradmin: 'User Access Administrator' };
+let roles = {};                  // email -> role id, persisted in roles.json
+const saveRoles = () => { try { fs.writeFileSync(ROLES_FILE, JSON.stringify(roles, null, 2)); } catch (_) {} };
+const roleOf = user => (user && roles[String(user.email || '').toLowerCase()]) || null;
+const canAssign = user => ['owner', 'useradmin'].includes(roleOf(user));   // may change role assignments
+const subManage = user => ['owner', 'contributor'].includes(roleOf(user)); // may change any app in the subscription
+const subOwner = () => Object.keys(roles).find(e => roles[e] === 'owner') || null;
+// The org a role can be handed out within: ORG_DOMAIN, else the owner's own mail domain.
+const orgDomain = () => String(process.env.ORG_DOMAIN || (subOwner() || '').split('@')[1] || '').toLowerCase();
+// True when `email` is the only Owner left — demoting or removing them would lock everyone out of role management.
+const lastOwner = email => Object.entries(roles).filter(([, r]) => r === 'owner').every(([e]) => e === email);
+// Someone has to be Owner, and on a fresh install that's whoever sets it up. SUBSCRIPTION_OWNER pins it instead.
+function claimOwner(email) {
+  if (!email || subOwner()) return;
+  roles[String(email).toLowerCase()] = 'owner'; saveRoles();
+}
+
+// Who may see an app: with sign-in off, everyone; otherwise any subscription role, its owner, its
+// collaborators, and legacy apps that predate owners. Single rule for the apps API and the assistant's tools alike.
+const canSee = (a, user) => !AUTH_ON || !a.owner || !!roleOf(user) ||
+  !!(user && (a.owner === user.email || (a.collaborators || []).includes(user.email)));
+// Who may change an app: the same list minus User Access Administrators — they manage access, not resources.
+const canWrite = (a, user) => !AUTH_ON || !a.owner || subManage(user) ||
+  !!(user && (a.owner === user.email || (a.collaborators || []).includes(user.email)));
 
 // ---- per-app access restrictions (enforced at the proxy, before anything reaches the app) ----
 // The platform listens on every interface, so without this every app is open to the LAN and to any
@@ -263,10 +291,12 @@ function pushLog(name, chunk) {
 function setStatus(name, status) {
   const a = find(name);
   if (a) a.status = status;
+  if (a && status === 'running') a.diagnosis = undefined; // back up → the last crash's root cause is history
   broadcast(name, 'status', status);
   save();
   // Email on terminal deploy outcomes. Fire-and-forget — a mail failure never blocks a deploy.
   if (status === 'running' || status === 'failed') notifyDeploy(a || { name }, status);
+  if (status === 'failed') diagnose(a); // async, fire-and-forget: ask Claude why, store the answer
 }
 
 // Who gets the email: the app's owner (set once Google login is wired up), else the configured fallback.
@@ -349,6 +379,9 @@ function procfileEntry(cwd, key) {
 // ponytail: convention-based, no per-app config, global pip/no venv, `dotnet run` assumes a single
 //   runnable project. When those corners bite, drop a Procfile in the repo — that's the upgrade path.
 function detectRuntime(cwd) {
+  // No code to look at — a deploy that never landed, or a folder deleted underneath us. Nothing matches,
+  // so callers take their existing "no runtime" path instead of path.join throwing on an undefined cwd.
+  if (!cwd || !fs.existsSync(cwd)) return null;
   const has = f => fs.existsSync(path.join(cwd, f));
   let files = [];
   try { files = fs.readdirSync(cwd); } catch (_) {}
@@ -447,7 +480,10 @@ async function deploy(app, token, checkout) {
 async function startApp(app, { graceful = false } = {}) {
   app.desired = 'running'; // expresses intent to run → drives auto-restart + boot auto-start
   const rt = detectRuntime(app.cwd);
-  if (!rt) { pushLog(app.name, `No runtime detected in ${app.cwd} — redeploy needed.`); return failDeploy(app); }
+  if (!rt) {
+    pushLog(app.name, app.cwd ? `No runtime detected in ${app.cwd} — redeploy needed.` : 'No deployed code yet — redeploy needed.');
+    return failDeploy(app);
+  }
 
   const oldChild = procs.get(app.name), oldContainer = app.container;
   // Swap in only when a live old process is actually serving (its status may read "building" mid-redeploy).
@@ -1010,6 +1046,7 @@ function insights(app, { q = '', level = 'all', limit = 200 } = {}) {
       failures: reqs.filter(r => r.status >= 400).slice(-25).reverse(), // newest first
     },
     peakRss: peak('rss'), peakCpu: peak('cpu'),
+    diagnosis: app.diagnosis || null,
     matched: hits.length, results: hits.slice(-limit).reverse(), // newest first
   };
 }
@@ -1130,6 +1167,39 @@ async function askAssistant(messages, visible) {
   return { reply: reply.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim(), pending };
 }
 
+// ---- automatic crash diagnosis ----
+// An app just hit `failed`: it is down and nothing is going to bring it back on its own. That is the
+// moment the assistant is most useful and least likely to be watched, so run it unprompted, scoped to
+// that one app, and leave the root cause in Application Insights for whenever the user looks. Off
+// without ANTHROPIC_API_KEY, exactly like the Assistant tab, and it never touches the app.
+// ponytail: one API call per failure with an in-flight guard. Add a cooldown if a redeploy loop that
+//   fails over and over gets expensive.
+const diagnosing = new Set();
+async function diagnose(app) {
+  if (!process.env.ANTHROPIC_API_KEY || !app || diagnosing.has(app.name)) return;
+  diagnosing.add(app.name);
+  try {
+    const { reply } = await askAssistant([{
+      role: 'user',
+      content: `The app "${app.name}" just entered the failed state on this host — it is down and will not restart itself. `
+        + `Call app_diagnostics for it (and host_metrics if the evidence points at the machine), then report the root cause: `
+        + `what broke, the exact log line that shows it, and the concrete fix. Four sentences at most. `
+        + `Nobody is reading this live, so ask no questions, and do not call request_restart or request_redeploy — `
+        + `there is no user here to click a button.`,
+    }], () => [app]); // tools resolve against this list only — it sees the broken app and nothing else
+    const a = find(app.name);
+    if (!reply || !a || a.status !== 'failed') return; // recovered while we were thinking — a stale diagnosis is worse than none
+    a.diagnosis = { text: reply.slice(0, 4000), at: new Date().toISOString() };
+    save();
+    // A pointer, not the text: the diagnosis quotes error lines, and the log file is what insights() counts.
+    pushLog(a.name, '↳ Auto-diagnosis ready — open Application Insights for the root cause.');
+  } catch (e) {
+    pushLog(app.name, `(auto-diagnosis unavailable: ${e.message})`);
+  } finally {
+    diagnosing.delete(app.name);
+  }
+}
+
 // Map an incoming Host header to an app name: an <app>.localhost subdomain, or a mapped custom domain.
 function hostToApp(hostname) {
   if (hostname.endsWith('.localhost') && hostname.length > '.localhost'.length) return hostname.slice(0, -('.localhost'.length));
@@ -1172,6 +1242,9 @@ const handler = async (req, res) => {
       if (parts[0] === 'api') return json(res, { error: 'Not authenticated' }, 401);
       res.writeHead(302, { Location: '/auth/login' }); return res.end(); // send the dashboard to Google
     }
+    // No Owner yet -> whoever is here first claims the subscription. Sits on the request rather than on
+    // the OAuth callback so an install that was already signed in before roles existed still gets one.
+    claimOwner(req.user.email);
   }
 
   if (req.method === 'GET' && u.pathname === '/api/metrics') return json(res, metrics());
@@ -1194,7 +1267,50 @@ const handler = async (req, res) => {
   }
 
   if (req.method === 'GET' && u.pathname === '/api/me') {
-    return json(res, { ...(AUTH_ON ? { auth: true, email: (req.user || {}).email, name: (req.user || {}).name } : { auth: false }), assistant: !!process.env.ANTHROPIC_API_KEY });
+    return json(res, {
+      ...(AUTH_ON ? { auth: true, email: (req.user || {}).email, name: (req.user || {}).name } : { auth: false }),
+      role: roleOf(req.user), roleName: ROLES[roleOf(req.user)] || null, canAssign: canAssign(req.user),
+      assistant: !!process.env.ANTHROPIC_API_KEY,
+    });
+  }
+
+  // ---- subscription access control (IAM): who holds which role across this whole Jerrick Cloud ----
+  if (parts[0] === 'api' && parts[1] === 'roles') {
+    if (!AUTH_ON) return json(res, { error: 'Enable Google sign-in (GOOGLE_CLIENT_ID/SECRET) to assign roles' }, 400);
+
+    if (req.method === 'GET' && parts.length === 2) {
+      return json(res, {
+        org: orgDomain(), owner: subOwner(), roles: ROLES,
+        myRole: roleOf(req.user), canAssign: canAssign(req.user),
+        assignments: Object.entries(roles).map(([email, role]) => ({ email, role, name: ROLES[role] || role })),
+      });
+    }
+
+    if (req.method === 'PUT' && parts.length === 2) {
+      if (!canAssign(req.user)) return json(res, { error: 'Only an Owner or User Access Administrator can assign roles' }, 403);
+      const body = await readBody(req);
+      const email = String(body.email || '').trim().toLowerCase();
+      const role = String(body.role || '').trim().toLowerCase();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return json(res, { error: 'Enter a valid email' }, 400);
+      if (!ROLES[role]) return json(res, { error: 'Unknown role' }, 400);
+      const org = orgDomain();
+      if (org && email.split('@')[1] !== org) return json(res, { error: `${email} is outside your organisation (@${org})` }, 400);
+      // Only an Owner hands out Owner — otherwise a User Access Administrator could just promote itself.
+      if (role === 'owner' && roleOf(req.user) !== 'owner') return json(res, { error: 'Only an Owner can grant the Owner role' }, 403);
+      if (roles[email] === 'owner' && role !== 'owner' && lastOwner(email))
+        return json(res, { error: 'The subscription must keep at least one Owner' }, 400);
+      roles[email] = role; saveRoles();
+      return json(res, { ok: true, email, role });
+    }
+
+    if (req.method === 'DELETE' && parts.length === 3) {
+      if (!canAssign(req.user)) return json(res, { error: 'Only an Owner or User Access Administrator can remove roles' }, 403);
+      const email = decodeURIComponent(parts[2]).toLowerCase();
+      if (roles[email] === 'owner' && roleOf(req.user) !== 'owner') return json(res, { error: 'Only an Owner can remove an Owner' }, 403);
+      if (roles[email] === 'owner' && lastOwner(email)) return json(res, { error: 'The subscription must keep at least one Owner' }, 400);
+      delete roles[email]; saveRoles();
+      return json(res, { ok: true });
+    }
   }
 
   // API bearer token: issue (POST, revokes any prior) / check (GET). Needs Google sign-in to have a stable owner.
@@ -1215,6 +1331,7 @@ const handler = async (req, res) => {
     return res.end(JSON.stringify(backup(a => canSee(a, req.user)), null, 2));
   }
   if (req.method === 'POST' && u.pathname === '/api/restore') {
+    if (roleOf(req.user) === 'useradmin') return json(res, { error: 'A User Access Administrator cannot restore apps' }, 403);
     const body = await readBody(req);
     if (!body || !Array.isArray(body.apps)) return json(res, { error: 'That is not a Jerrick Cloud backup file' }, 400);
     return json(res, restore(body));
@@ -1233,6 +1350,8 @@ const handler = async (req, res) => {
     if (req.method === 'GET' && parts.length === 2) return json(res, apps.filter(mine).map(publicApp));
 
     if (req.method === 'POST' && parts.length === 2) {
+      // A User Access Administrator manages access, not resources. Anyone else signed in still creates their own apps.
+      if (roleOf(req.user) === 'useradmin') return json(res, { error: 'A User Access Administrator cannot create apps' }, 403);
       const body = await readBody(req);
       const name = slugify(body.name);
       const source = String(body.source || '').trim();
@@ -1275,6 +1394,11 @@ const handler = async (req, res) => {
 
     const app = find(parts[2]);
     if (!app || !mine(app)) return json(res, { error: 'Not found' }, 404); // owned by someone else → 404, not 403
+    // One gate for every mutating route below (GETs are already covered by canSee above), so a read-only
+    // role can't slip through a route someone adds later. Access management is the exception: that's
+    // exactly what a User Access Administrator is for.
+    if (req.method !== 'GET' && !canWrite(app, req.user) && !(canAssign(req.user) && parts[3] === 'collaborators'))
+      return json(res, { error: `Your subscription role (${ROLES[roleOf(req.user)]}) is read-only for apps` }, 403);
 
     if (req.method === 'GET' && parts.length === 3) return json(res, publicApp(app));
 
@@ -1340,8 +1464,12 @@ const handler = async (req, res) => {
       return json(res, { ok: true, healthPath: app.healthPath || '' });
     }
 
+    // Sharing an app is access management, so it takes the app's own owner or a role that grants access
+    // across the subscription — a Contributor can run the app but not widen who reaches it (as in Azure).
+    const canShare = () => !AUTH_ON || !app.owner || req.user.email === app.owner || canAssign(req.user);
+
     if (req.method === 'POST' && parts[3] === 'collaborators' && parts.length === 4) {
-      if (AUTH_ON && app.owner && req.user.email !== app.owner) return json(res, { error: 'Only the owner can share this app' }, 403);
+      if (!canShare()) return json(res, { error: 'Only the owner can share this app' }, 403);
       const body = await readBody(req);
       const email = String(body.email || '').trim().toLowerCase();
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return json(res, { error: 'Enter a valid email' }, 400);
@@ -1349,7 +1477,7 @@ const handler = async (req, res) => {
       return json(res, publicApp(app));
     }
     if (req.method === 'DELETE' && parts[3] === 'collaborators' && parts.length === 5) {
-      if (AUTH_ON && app.owner && req.user.email !== app.owner) return json(res, { error: 'Only the owner can share this app' }, 403);
+      if (!canShare()) return json(res, { error: 'Only the owner can share this app' }, 403);
       app.collaborators = (app.collaborators || []).filter(e => e !== decodeURIComponent(parts[4]).toLowerCase()); save();
       return json(res, publicApp(app));
     }
@@ -1588,6 +1716,13 @@ if (process.argv.includes('--check')) {
   assert.equal(find('__restore_test__').pid, null);
   assert.deepEqual(restore({ apps: [{ name: '__restore_test__' }] }), { added: [], skipped: ['__restore_test__'], notes: [] });
   apps = apps.filter(a => a.name !== '__restore_test__'); save();
+  // Auto-diagnosis: a no-op without an API key, and a recovered app drops its stale diagnosis.
+  delete process.env.ANTHROPIC_API_KEY;
+  assert.doesNotThrow(() => diagnose({ name: '__no_such_app__' }));
+  apps.push({ name: '__diag_test__', status: 'failed', diagnosis: { text: 'stale', at: 'then' } });
+  setStatus('__diag_test__', 'running');
+  assert.equal(find('__diag_test__').diagnosis, undefined);
+  apps = apps.filter(a => a.name !== '__diag_test__'); save();
   // publicApp never hands the access password back to the browser — just whether one is set.
   const _pw = publicApp({ name: 'x', env: {}, accessPassword: encVal('s3cret') });
   assert.equal(_pw.accessPassword, undefined); assert.equal(_pw.hasPassword, true);
@@ -1598,6 +1733,29 @@ if (process.argv.includes('--check')) {
   // App visibility: with sign-in off everyone sees everything; the rule the assistant's tools share.
   assert.ok(canSee({ name: 'x' }, null));
   assert.ok(canSee({ owner: 'a@b.com' }, { email: 'a@b.com' }));
+  // Subscription roles: who can manage apps, who can hand out roles, who is read-only.
+  const _realRoles = loadJSON(ROLES_FILE, null); // claimOwner persists — put the real assignments back after
+  roles = { 'boss@acme.com': 'owner', 'dev@acme.com': 'contributor', 'iam@acme.com': 'useradmin' };
+  const _as = e => ({ email: e });
+  assert.deepEqual([subOwner(), orgDomain()], ['boss@acme.com', 'acme.com']);
+  assert.deepEqual(['boss', 'dev', 'iam', 'nobody'].map(u => subManage(_as(u + '@acme.com'))), [true, true, false, false]);
+  assert.deepEqual(['boss', 'dev', 'iam', 'nobody'].map(u => canAssign(_as(u + '@acme.com'))), [true, false, true, false]);
+  // Someone else's app: an Owner/Contributor can change it, a User Access Administrator only reads it.
+  const _theirs = { owner: 'someone@acme.com', collaborators: [] };
+  assert.ok(canSee(_theirs, _as('iam@acme.com')) && canSee(_theirs, _as('dev@acme.com')));
+  assert.ok(canWrite(_theirs, _as('dev@acme.com')));
+  if (AUTH_ON) assert.ok(!canWrite(_theirs, _as('iam@acme.com')));
+  // Lock-out guard: the sole Owner can't be demoted or removed; a second Owner frees the first.
+  assert.ok(lastOwner('boss@acme.com'));
+  roles['boss2@acme.com'] = 'owner';
+  assert.ok(!lastOwner('boss@acme.com'));
+  roles = {};
+  claimOwner('First@Acme.com');                       // fresh install -> first sign-in claims it, lower-cased
+  assert.equal(subOwner(), 'first@acme.com');
+  claimOwner('second@acme.com');                      // an Owner already exists -> no silent takeover
+  assert.equal(Object.keys(roles).length, 1);
+  roles = _realRoles || {};
+  if (_realRoles) saveRoles(); else { try { fs.rmSync(ROLES_FILE, { force: true }); } catch (_) {} }
   // Assistant tool surface: three read-only tools, and env var VALUES never leave this machine.
   const _visible = () => [{ name: 'demo', status: 'stopped', size: 'basic', env: encEnv({ SECRET_KEY: 'hunter2' }), deploys: [], domains: [] }];
   const _tools = assistantTools(_visible);
@@ -1625,6 +1783,9 @@ if (process.argv.includes('--check')) {
   // Restore persisted logins, API tokens, and metric history so a restart is seamless.
   for (const [sid, u] of loadJSON(SESS_FILE, [])) sessions.set(sid, u);
   tokens = loadJSON(TOKENS_FILE, {});
+  roles = loadJSON(ROLES_FILE, {});
+  // SUBSCRIPTION_OWNER pins the Owner; without it the first person to sign in claims the subscription.
+  if (process.env.SUBSCRIPTION_OWNER) { roles[process.env.SUBSCRIPTION_OWNER.toLowerCase()] = 'owner'; saveRoles(); }
   const savedMetrics = loadJSON(METRICS_FILE, null);
   if (savedMetrics) {
     if (Array.isArray(savedMetrics.host)) metricHistory.push(...savedMetrics.host.slice(-METRIC_HISTORY));

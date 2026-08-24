@@ -27,7 +27,8 @@ node server.js --check    # run the self-checks
 - **Plans with real memory caps** — Scale up tab. Each plan (Free 512 MB → Premium 4 GB) sets a ceiling: an app that overruns is restarted, Node gets a matching `--max-old-space-size`, Docker a `--memory` limit.
 - **Idle sleep** — set a minutes-idle value (Configuration tab) and the app is stopped after that long without traffic, then started again on the next request through the proxy. Frees memory on a box running more apps than it uses; the first request after sleeping waits for the cold start (~0.5s for a small app). Sleeping apps stay asleep across a platform restart.
 - **Access restrictions** — password-protect an app (HTTP Basic, any username) and/or limit it to an IP allow list, enforced at the proxy before anything reaches the app. Covers the `*.localhost` subdomain, custom domains, and WebSocket upgrades alike. Worth setting on anything you expose through a tunnel — the platform listens on every interface, so an app is otherwise reachable by everything on your LAN.
-- **Sharing** — add collaborators by Google email (owner only); they see and control the app.
+- **Sharing** — add collaborators by Google email; they see and control that one app. Grantable by the app's owner or by anyone holding a role that manages access (below).
+- **Subscription roles (Access control / IAM)** — Azure's three built-ins, scoped to the whole subscription rather than one app, on the dashboard under *Access control (IAM)*. **Owner** controls every app and hands out roles; **Contributor** controls every app but cannot change who has access; **User Access Administrator** hands out roles and reads apps but changes none. Roles can only be granted to addresses in your organisation — the owner's own mail domain, or `ORG_DOMAIN`. The first person to sign in claims Owner (or pin it with `SUBSCRIPTION_OWNER`), and the last Owner can't be demoted or removed, so nobody can lock the subscription. Stored in `logs/roles.json`.
 - **API tokens** — issue a Bearer token (Configuration tab) and drive the API from a CLI / CI with `Authorization: Bearer <token>`.
 - **Scheduled jobs** — cron lines per app (`0 3 * * *`, `*/15 * * * *`, …) run a command in the app's folder with its env vars; Docker apps run theirs inside the container. Output lands in the log stream. A run that's still going when the job comes due again is skipped, never stacked.
 
@@ -36,6 +37,7 @@ node server.js --check    # run the self-checks
 
 **Monitoring**
 - **Assistant tab** — ask Claude about your apps in plain language (*why did protein-left stop?*, *which app is using the most memory?*). It calls read-only tools over your live status, per-app memory/CPU, deploy history, host metrics, and stored logs before answering, so it quotes the actual error line and names the fix. Scoped to the apps you can see; environment variable **names** are visible to it, values never are. It can **propose** a restart or redeploy when its diagnosis calls for one — that only puts a Confirm button in the chat, which runs the same action the toolbar does; nothing happens until you click it. Everything else it explains and points you at the right tab. Set `ANTHROPIC_API_KEY` to turn it on.
+- **Auto-diagnosis on failure** — when an app gives up (a crash-loop, or a deploy that dies with nothing left serving), the assistant runs itself: it reads that app's logs, metrics, deploy history and the host's memory/disk, then writes the root cause — what broke, the log line that proves it, the fix — into **Application Insights → Why it failed**. The log stream gets a one-line pointer; the diagnosis is stored, survives a restart, and clears the moment the app runs again. Nobody has to be watching, and it never touches the app. Same `ANTHROPIC_API_KEY` as the Assistant tab; unset → the app just fails quietly like before.
 - **Application Insights tab** — everything the app has logged is stored on disk (`logs/<app>.log`, survives restarts) and searchable here: substring search, filter by error / warning / info, and the values to check when something breaks — errors and warnings logged, last error, restarts, requests seen, failed requests, avg + p95 response time, peak memory / CPU, and a table of recent 4xx/5xx requests through the proxy. Full log downloadable.
 - **Metrics tab** — this app's process memory / CPU / uptime / restarts / health, plus live host memory & disk with sparklines and a sample log. Per-app history is sampled and persisted.
 - **Threshold alerts** — emails when host memory or disk crosses 85% (set `ALERT_PCT` to change). Reuses the SMTP config below.
@@ -50,13 +52,15 @@ node server.js --check    # run the self-checks
 | Var | Purpose |
 |-----|---------|
 | `PORT` | Platform port (default 8080). |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Enable Google sign-in. When set, users only see their own apps. |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Enable Google sign-in. When set, users only see their own apps (plus whatever their subscription role grants). |
+| `SUBSCRIPTION_OWNER` | Email that holds the Owner role. Unset → the first person to sign in claims it. |
+| `ORG_DOMAIN` | Mail domain roles may be granted within. Unset → the owner's own domain. |
 | `GMAIL_USER` / `GMAIL_APP_PASS` / `NOTIFY_TO` | SMTP for deploy + threshold-alert emails. |
 | `ALERT_PCT` | Memory/disk alert threshold percent (default 85). |
 | `SSL_CERT` / `SSL_KEY` | Paths to a cert/key pair → serve over HTTPS. |
 | `JC_SECRET` | Key for env-var-at-rest encryption. Unset → a random key is generated and stored in `logs/.secret`. |
 | `MONGODB_URI` | First-login user persistence (MongoDB — a connection string; db name optional in the URI). |
-| `ANTHROPIC_API_KEY` | Turns the Assistant tab on. Unset → the assistant is off, everything else runs. |
+| `ANTHROPIC_API_KEY` | Turns the Assistant tab and auto-diagnosis on. Unset → both off, everything else runs. |
 | `ANTHROPIC_BASE_URL` | Optional endpoint override — point it at a gateway/proxy instead of `api.anthropic.com`. |
 | `ANTHROPIC_MODEL` | Optional model override (default `claude-opus-5`). |
 
