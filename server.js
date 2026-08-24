@@ -207,6 +207,38 @@ const canSee = (a, user) => !AUTH_ON || !a.owner || !!roleOf(user) ||
 const canWrite = (a, user) => !AUTH_ON || !a.owner || subManage(user) ||
   !!(user && (a.owner === user.email || (a.collaborators || []).includes(user.email)));
 
+// ---- activity log ----
+// Append-only record of who did what. IAM answers "who may"; this answers "who did", which is the
+// question you actually have after something disappears. One JSON object per line, so a write is an
+// append with no parse-and-rewrite, and a half-line left by a trim just fails its own JSON.parse.
+// ponytail: whole-file read on the GET, byte-capped like the app logs. Fine for a home box — move it
+//   to a real store if the file ever gets big enough to notice.
+const ACTIVITY_FILE = path.join(LOG_DIR, 'activity.jsonl');
+const ACTIVITY_CAP = 1024 * 1024;   // trim to the last half once it passes this, same as logs/<app>.log
+function logActivity(user, action, app, detail, denied) {
+  try {
+    const e = { at: new Date().toISOString(), by: (user && user.email) || 'local', action };
+    if (app) e.app = app;
+    if (detail) e.detail = String(detail).slice(0, 500);
+    if (denied) e.denied = true;
+    fs.appendFileSync(ACTIVITY_FILE, JSON.stringify(e) + '\n');
+    if (fs.statSync(ACTIVITY_FILE).size > ACTIVITY_CAP)
+      fs.writeFileSync(ACTIVITY_FILE, fs.readFileSync(ACTIVITY_FILE).slice(-ACTIVITY_CAP / 2));
+  } catch (_) {} // an audit write must never break the action it is auditing
+}
+// Visible to whoever could have caused it or can see what it touched: the actor, anyone holding a
+// subscription role (they read every app anyway), and anyone the named app is shared with. An entry
+// about an app that has since been deleted therefore stays with the actor and the role holders.
+const canSeeEntry = (e, user) => !AUTH_ON || !!roleOf(user) || e.by === (user && user.email) ||
+  (!!e.app && !!find(e.app) && canSee(find(e.app), user));
+function activity(user, limit = 200) {
+  let lines = [];
+  try { lines = fs.readFileSync(ACTIVITY_FILE, 'utf8').split('\n'); } catch (_) {} // nothing recorded yet
+  const out = [];
+  for (const l of lines) { try { const e = JSON.parse(l); if (canSeeEntry(e, user)) out.push(e); } catch (_) {} }
+  return out.slice(-limit).reverse(); // newest first
+}
+
 // ---- per-app access restrictions (enforced at the proxy, before anything reaches the app) ----
 // The platform listens on every interface, so without this every app is open to the LAN and to any
 // tunnel pointed at it. Two independent gates, both optional: an IP allow list and a password.
@@ -911,6 +943,7 @@ async function handleCallback(req, res, u) {
     const sid = crypto.randomBytes(16).toString('hex');
     sessions.set(sid, user); saveSessions(); // persist so a server restart doesn't sign everyone out
     await recordUser(user); // first-time users -> MongoDB; failures never block sign-in
+    logActivity(user, 'sign-in');
     res.writeHead(302, { 'Set-Cookie': `jc_session=${sid}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800`, Location: '/' });
     res.end();
   } catch (e) { res.writeHead(500); res.end('Sign-in failed: ' + e.message); }
@@ -1231,7 +1264,8 @@ const handler = async (req, res) => {
     if (u.pathname === '/auth/google') return startLogin(res);
     if (u.pathname === '/auth/callback') return handleCallback(req, res, u);
     if (u.pathname === '/auth/logout') {
-      const sid = parseCookies(req).jc_session; if (sid) { sessions.delete(sid); saveSessions(); }
+      const sid = parseCookies(req).jc_session;
+      if (sid) { logActivity(sessions.get(sid), 'sign-out'); sessions.delete(sid); saveSessions(); }
       res.writeHead(302, { 'Set-Cookie': 'jc_session=; HttpOnly; Path=/; Max-Age=0', Location: '/auth/login' });
       return res.end();
     }
@@ -1247,6 +1281,8 @@ const handler = async (req, res) => {
     claimOwner(req.user.email);
   }
 
+  if (req.method === 'GET' && u.pathname === '/api/activity')
+    return json(res, activity(req.user, Math.min(500, Number(u.searchParams.get('limit')) || 200)));
   if (req.method === 'GET' && u.pathname === '/api/metrics') return json(res, metrics());
   if (req.method === 'GET' && u.pathname === '/api/metrics/history') return json(res, metricHistory);
 
@@ -1300,6 +1336,7 @@ const handler = async (req, res) => {
       if (roles[email] === 'owner' && role !== 'owner' && lastOwner(email))
         return json(res, { error: 'The subscription must keep at least one Owner' }, 400);
       roles[email] = role; saveRoles();
+      logActivity(req.user, 'grant', null, `${email} → ${ROLES[role]}`);
       return json(res, { ok: true, email, role });
     }
 
@@ -1308,7 +1345,8 @@ const handler = async (req, res) => {
       const email = decodeURIComponent(parts[2]).toLowerCase();
       if (roles[email] === 'owner' && roleOf(req.user) !== 'owner') return json(res, { error: 'Only an Owner can remove an Owner' }, 403);
       if (roles[email] === 'owner' && lastOwner(email)) return json(res, { error: 'The subscription must keep at least one Owner' }, 400);
-      delete roles[email]; saveRoles();
+      const was = roles[email]; delete roles[email]; saveRoles();
+      logActivity(req.user, 'revoke', null, `${email} (was ${ROLES[was] || was})`);
       return json(res, { ok: true });
     }
   }
@@ -1334,7 +1372,9 @@ const handler = async (req, res) => {
     if (roleOf(req.user) === 'useradmin') return json(res, { error: 'A User Access Administrator cannot restore apps' }, 403);
     const body = await readBody(req);
     if (!body || !Array.isArray(body.apps)) return json(res, { error: 'That is not a Jerrick Cloud backup file' }, 400);
-    return json(res, restore(body));
+    const restored = restore(body);
+    logActivity(req.user, 'restore', null, `added ${restored.added.length}, skipped ${restored.skipped.length}`);
+    return json(res, restored);
   }
 
   if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/index.html')) {
@@ -1382,12 +1422,14 @@ const handler = async (req, res) => {
           if (!ok) { pushLog(name, 'Failed to extract zip (no tar/unzip on this host?)'); return setStatus(name, 'failed'); }
           deploy(app);
         });
+        logActivity(req.user, 'create', name, `zip upload, ${(buf.length / 1024).toFixed(0)} KB`);
         return json(res, app, 201);
       }
 
       if (!source) return json(res, { error: 'A Git URL, local folder path, or zip upload is required' }, 400);
       const app = { ...base, source, managed: isRemote(source) };
       apps.push(app); save();
+      logActivity(req.user, 'create', name, source);
       deploy(app, token); // fire and forget; progress streams over SSE
       return json(res, app, 201);
     }
@@ -1397,8 +1439,16 @@ const handler = async (req, res) => {
     // One gate for every mutating route below (GETs are already covered by canSee above), so a read-only
     // role can't slip through a route someone adds later. Access management is the exception: that's
     // exactly what a User Access Administrator is for.
-    if (req.method !== 'GET' && !canWrite(app, req.user) && !(canAssign(req.user) && parts[3] === 'collaborators'))
-      return json(res, { error: `Your subscription role (${ROLES[roleOf(req.user)]}) is read-only for apps` }, 403);
+    // Every mutation is recorded here, taken or refused — one place, so a route added later is audited
+    // for free. exec records itself instead: its command only exists once the body has been read.
+    if (req.method !== 'GET') {
+      const act = parts[3] || 'delete';
+      if (!canWrite(app, req.user) && !(canAssign(req.user) && parts[3] === 'collaborators')) {
+        logActivity(req.user, act, app.name, null, true);
+        return json(res, { error: `Your subscription role (${ROLES[roleOf(req.user)]}) is read-only for apps` }, 403);
+      }
+      if (act !== 'exec') logActivity(req.user, act, app.name, parts[4] && decodeURIComponent(parts[4]));
+    }
 
     if (req.method === 'GET' && parts.length === 3) return json(res, publicApp(app));
 
@@ -1527,6 +1577,7 @@ const handler = async (req, res) => {
       const cmd = String((await readBody(req)).cmd || '').trim();
       if (!cmd) return json(res, { error: 'A command is required' }, 400);
       if (!app.cwd || !fs.existsSync(app.cwd)) return json(res, { error: 'No deployed code to run against yet' }, 400);
+      logActivity(req.user, 'exec', app.name, cmd);
       const [c, a, shell] = app.container
         ? ['docker', ['exec', app.container, 'sh', '-c', cmd], false]
         : [cmd, [], true]; // host shell, in app.cwd, with the app's env
@@ -1745,6 +1796,13 @@ if (process.argv.includes('--check')) {
   assert.ok(canSee(_theirs, _as('iam@acme.com')) && canSee(_theirs, _as('dev@acme.com')));
   assert.ok(canWrite(_theirs, _as('dev@acme.com')));
   if (AUTH_ON) assert.ok(!canWrite(_theirs, _as('iam@acme.com')));
+  // Activity log visibility: your own actions, everything if you hold a role, nothing else.
+  assert.ok(canSeeEntry({ by: 'nobody@acme.com', action: 'sign-in' }, _as('nobody@acme.com')));
+  assert.ok(canSeeEntry({ by: 'someone@acme.com', action: 'delete', app: '__gone__' }, _as('iam@acme.com')));
+  if (AUTH_ON) {
+    assert.ok(!canSeeEntry({ by: 'someone@acme.com', action: 'delete', app: '__gone__' }, _as('nobody@acme.com')));
+    assert.ok(!canSeeEntry({ by: 'someone@acme.com', action: 'sign-in' }, _as('nobody@acme.com')));
+  }
   // Lock-out guard: the sole Owner can't be demoted or removed; a second Owner frees the first.
   assert.ok(lastOwner('boss@acme.com'));
   roles['boss2@acme.com'] = 'owner';

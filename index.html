@@ -310,6 +310,15 @@
       <div class="err" id="iam-err"></div>
       <div id="iam-list"></div>
     </details>
+
+    <details class="card" id="act-card" style="margin-top:14px">
+      <summary style="cursor:pointer; font-weight:650">Activity log</summary>
+      <p class="desc" style="margin:10px 0">Who changed what, newest first — creates, deploys, restarts, config edits, console commands, role grants and sign-ins, including the ones a role refused. Recorded in <span class="mono">logs/activity.jsonl</span>, so it survives a restart. You see the entries for apps you can see; a subscription role sees them all.</p>
+      <div class="tbl-wrap">
+        <table><thead><tr><th>When</th><th>Who</th><th>Action</th><th>App</th><th>Detail</th></tr></thead><tbody id="act-tbody"></tbody></table>
+      </div>
+      <div class="muted" id="act-empty" style="margin-top:10px"></div>
+    </details>
   </div>
 </div>
 
@@ -752,6 +761,7 @@
         <div class="app-card-foot">${open}<span class="muted">${esc(created)}</span></div>
       </div>`;
     }).join('');
+    loadActivity();  // the dashboard is where you come to ask who did what
   }
 
   // ---------- app detail ----------
@@ -970,6 +980,20 @@
     const j = await fetch('/api/roles/' + encodeURIComponent(email), { method: 'DELETE' }).then(r => r.json());
     if (j.error) { $('#iam-err').textContent = j.error; return; }
     loadRoles();
+  }
+
+// ---- activity log (subscription-wide; the server scopes it to what you may see) ----
+  async function loadActivity() {
+    const rows = await fetch('/api/activity').then(r => r.json()).catch(() => []);
+    if (!Array.isArray(rows)) return;
+    $('#act-empty').textContent = rows.length ? '' : 'Nothing recorded yet.';
+    $('#act-tbody').innerHTML = rows.map(e => `<tr>
+      <td class="mono">${esc(new Date(e.at).toLocaleString())}</td>
+      <td class="mono">${esc(e.by)}</td>
+      <td>${e.denied ? `<span class="health-bad">${esc(e.action)} refused</span>` : esc(e.action)}</td>
+      <td class="mono">${esc(e.app || '—')}</td>
+      <td class="mono ellipsis" title="${esc(e.detail || '')}">${esc(e.detail || '')}</td>
+    </tr>`).join('');
   }
 
   // ---- API token ----
