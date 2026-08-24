@@ -21,7 +21,19 @@ node server.js --check    # run the self-checks
 - **Auto-deploy on push** — each app has a webhook URL (Deployment Center → *Auto-deploy on git push*). Add it as a GitHub webhook and every push redeploys.
 - **History + rollback** — recent deploys are listed with their commit; roll a Git app back to any of them.
 - **Release command** — a Procfile `release:` line runs once after install, before start (migrations, asset builds).
-- **Editable env vars** — Configuration tab, **encrypted at rest** in `apps.json`. Applied on the next start/restart. `PORT` is always injected.
+- **`jerrick.json` — config that ships with the code** — drop one in the repo root and the plan, health check path, idle sleep and scheduled jobs travel with the app instead of living only in this host's `apps.json`. Applied on every deploy, so the file owns the fields it names (the way a `Procfile` already owns the start command) — change one in the portal and the next deploy puts it back. Declared environment variables are *defaults only*: a key already set in Configuration is never overwritten, so a repo file can't clobber a secret. Unknown plans, bad cron lines and invalid variable names are logged in the build output and skipped; a broken manifest never fails a deploy.
+
+  ```json
+  {
+    "plan": "standard",
+    "healthPath": "/healthz",
+    "idleMin": 30,
+    "env": { "NODE_ENV": "production" },
+    "jobs": [{ "schedule": "0 3 * * *", "cmd": "npm run cleanup" }]
+  }
+  ```
+
+- **Editable env vars** — Configuration tab, **encrypted at rest** in `apps.json`. Applied on the next start/restart. `PORT` is always injected. Non-secret defaults can ship in `jerrick.json` instead (above).
 
 **Scale & access**
 - **Plans with real memory caps** — Scale up tab. Each plan (Free 512 MB → Premium 4 GB) sets a ceiling: an app that overruns is restarted, Node gets a matching `--max-old-space-size`, Docker a `--memory` limit.

@@ -444,6 +444,61 @@ function detectRuntime(cwd) {
   return rt;
 }
 
+// ---- jerrick.json: the app's own configuration, committed next to its code ----
+// Everything in Configuration / Scale up lives only in this host's apps.json, so a fresh Jerrick Cloud
+// gets a bare app even from a repo that has been tuned for months. A jerrick.json in the repo root
+// carries the plan, health check path, idle sleep and scheduled jobs along with the code, and is
+// applied on every deploy — the file owns the fields it names, the way a Procfile already owns the
+// start command. Environment variables are the exception: declared ones are defaults that never
+// overwrite a value already set here, so a repo file can't clobber a secret typed into Configuration.
+// A bad field is logged and skipped; a bad manifest never fails a deploy.
+// ponytail: no domains (they collide across apps and want the 409 check the route does) and no
+//   build/start (the Procfile owns those). Add them when a repo actually needs them.
+function applyManifest(app, cwd) {
+  let m;
+  try { m = JSON.parse(fs.readFileSync(path.join(cwd, 'jerrick.json'), 'utf8')); }
+  catch (e) { if (e.code !== 'ENOENT') pushLog(app.name, `Ignoring jerrick.json — ${e.message}`); return; }
+  if (!m || typeof m !== 'object') return;
+  const applied = [];
+
+  if ('plan' in m) {
+    const plan = String(m.plan).toLowerCase();
+    if (PLANS[plan]) { app.size = plan; applied.push(`plan ${plan} (${PLANS[plan]} MB)`); }
+    else pushLog(app.name, `jerrick.json: unknown plan "${m.plan}" — keeping ${app.size || 'free'}`);
+  }
+  if ('healthPath' in m) {
+    let p = String(m.healthPath || '').trim();
+    if (p && !p.startsWith('/')) p = '/' + p;
+    app.healthPath = p || undefined;
+    applied.push(`health check ${p || 'off'}`);
+  }
+  if ('idleMin' in m) {
+    const n = Math.max(0, Math.min(1440, Math.round(Number(m.idleMin) || 0)));
+    app.idleMin = n || undefined;
+    applied.push(`idle sleep ${n ? n + ' min' : 'off'}`);
+  }
+  if ('jobs' in m) {
+    const jobs = (Array.isArray(m.jobs) ? m.jobs : []).slice(0, 20)
+      .map(j => ({ schedule: String((j || {}).schedule || '').trim(), cmd: String((j || {}).cmd || '').trim() }))
+      .filter(j => j.schedule && j.cmd);
+    for (const j of jobs) if (!cronValid(j.schedule)) pushLog(app.name, `jerrick.json: "${j.schedule}" is not a valid cron schedule — that job is skipped`);
+    app.jobs = jobs.filter(j => cronValid(j.schedule));
+    applied.push(`${app.jobs.length} scheduled job(s)`);
+  }
+  if (m.env && typeof m.env === 'object') {
+    const cur = decEnv(app.env), added = [];
+    for (const [k, v] of Object.entries(m.env)) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) { pushLog(app.name, `jerrick.json: "${k}" is not a valid environment variable name — skipped`); continue; }
+      if (k in cur) continue; // already set on this host → the repo file defers, so a secret survives
+      cur[k] = String(v); added.push(k);
+    }
+    if (added.length) { app.env = encEnv(cur); applied.push(`env defaults ${added.join(', ')}`); }
+  }
+
+  if (applied.length) pushLog(app.name, `Applied jerrick.json — ${applied.join('; ')}`);
+  save();
+}
+
 async function deploy(app, token, checkout) {
   logbuf.set(app.name, []); // fresh build log
   setStatus(app.name, 'building');
@@ -477,6 +532,7 @@ async function deploy(app, token, checkout) {
     if (!fs.existsSync(cwd)) { pushLog(app.name, `Path not found: ${cwd}`); return failDeploy(app); }
   }
   app.cwd = cwd;
+  applyManifest(app, cwd); // repo-declared plan / health path / idle sleep / jobs / env defaults
 
   // Detect the runtime BEFORE running anything. If this is missing, npm/etc. can walk UP to the
   // platform's own package.json and run server.js (Jerrick Cloud) as the "app" — it kills its own tree.
@@ -1714,6 +1770,28 @@ if (process.argv.includes('--check')) {
   const _ins = insights({ name: '__no_such_app__', status: 'stopped' });
   assert.equal(_ins.lines, 0); assert.equal(_ins.counts.error, 0); assert.equal(_ins.lastError, null);
   assert.equal(_ins.requests.total, 0); assert.equal(_ins.requests.avgMs, null); assert.deepEqual(_ins.results, []);
+  // jerrick.json: the repo file owns the fields it names, env vars are defaults only, a bad field is
+  // skipped rather than failing the deploy, and a missing file changes nothing.
+  const _mdir = fs.mkdtempSync(path.join(os.tmpdir(), 'jc-mf-'));
+  const _mapp = { name: '__manifest_test__', size: 'free', env: encEnv({ SECRET: 'mine' }) };
+  applyManifest(_mapp, _mdir);
+  assert.equal(_mapp.size, 'free');                              // no jerrick.json -> untouched
+  fs.writeFileSync(path.join(_mdir, 'jerrick.json'), JSON.stringify({
+    plan: 'standard', healthPath: 'healthz', idleMin: 5000, env: { SECRET: 'from-repo', NODE_ENV: 'production' },
+    jobs: [{ schedule: '0 3 * * *', cmd: 'npm run cleanup' }, { schedule: 'nope', cmd: 'x' }],
+  }));
+  applyManifest(_mapp, _mdir);
+  assert.equal(_mapp.size, 'standard');
+  assert.equal(_mapp.healthPath, '/healthz');                    // leading slash added, as in the UI
+  assert.equal(_mapp.idleMin, 1440);                             // clamped to a day
+  assert.deepEqual(_mapp.jobs, [{ schedule: '0 3 * * *', cmd: 'npm run cleanup' }]); // bad cron dropped
+  assert.equal(decEnv(_mapp.env).SECRET, 'mine');                // never overwrites a value set on this host
+  assert.equal(decEnv(_mapp.env).NODE_ENV, 'production');        // new keys land as defaults
+  fs.writeFileSync(path.join(_mdir, 'jerrick.json'), '{ not json');
+  assert.doesNotThrow(() => applyManifest(_mapp, _mdir));        // a broken manifest never fails a deploy
+  assert.equal(_mapp.size, 'standard');
+  fs.rmSync(_mdir, { recursive: true, force: true });
+  fs.rmSync(logFile('__manifest_test__'), { force: true });
   // Static-site detection: index.html (root or a built subdir) is the last-resort runtime, and it must
   // never win over a real stack — a Vite repo has both package.json and index.html and is a Node app.
   const _tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jc-rt-'));
