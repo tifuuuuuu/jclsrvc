@@ -93,9 +93,15 @@ const HELP = `jc — Jerrick Cloud CLI
   jc env <name>                               show env vars
   jc env <name> KEY=val [KEY=val ...]         set env vars (merged)
   jc scale <name> <plan>                      change plan (memory cap)
-  jc stats <name>                             cpu / memory / uptime
+  jc stats <name>                             cpu / memory / disk / uptime
+  jc domains <name> [add|rm <hostname>]       list / map / unmap custom domains
+  jc roles [list|grant <email> <role>|revoke <email>]   subscription access control (IAM)
+  jc activity [--limit n]                     who did what, newest first
+  jc backup [file.json]                       download every app definition + the env-var key
   jc open <name>                              print the app URL
   jc delete <name>                            remove the app
+
+Per-app plan, health path, idle sleep, rate limit and cron jobs travel in the repo's jerrick.json.
 
 Env: JC_URL, JC_TOKEN override the saved config.`;
 
@@ -163,12 +169,61 @@ async function main() {
       if (!rest[0]) return die('usage: jc stats <name>');
       const s = await api('GET', `/api/apps/${rest[0]}/stats`);
       const mb = b => b ? (b / 1048576).toFixed(0) + ' MB' : '-';
-      return console.log(`status=${s.status} health=${s.health} cpu=${s.cpu ?? '-'}% mem=${mb(s.rss)}/${s.memMb}MB uptime=${s.uptimeSec}s restarts=${s.restarts}`);
+      return console.log(`status=${s.status} health=${s.health} cpu=${s.cpu ?? '-'}% mem=${mb(s.rss)}/${s.memMb}MB disk=${mb(s.disk)} uptime=${s.uptimeSec}s restarts=${s.restarts}`);
     }
     case 'open': {
       if (!rest[0]) return die('usage: jc open <name>');
       const a = await api('GET', `/api/apps/${rest[0]}`);
       return console.log(a.url || '(not running)');
+    }
+    case 'domains': {
+      // The one per-app setting jerrick.json deliberately does not carry (hostnames collide across
+      // apps, so they want the server's uniqueness check), which leaves the CLI as the scripted route.
+      const [name, action, host] = rest;
+      if (!name) return die('usage: jc domains <name> [add|rm <hostname>]');
+      if (!action) {
+        const a = await api('GET', `/api/apps/${name}`);
+        return (a.domains || []).length ? a.domains.forEach(d => console.log(d)) : console.log('(no custom domains)');
+      }
+      if (!host) return die(`usage: jc domains ${name} ${action} <hostname>`);
+      if (action === 'add') { await api('POST', `/api/apps/${name}/domains`, { domain: host }); return console.log(`${host} → ${name}`); }
+      if (action === 'rm' || action === 'remove') { await api('DELETE', `/api/apps/${name}/domains/${encodeURIComponent(host)}`); return console.log(`Removed ${host}`); }
+      return die('usage: jc domains <name> [add|rm <hostname>]');
+    }
+    case 'roles': {
+      const [action, email, role] = rest;
+      if (!action || action === 'list') {
+        const d = await api('GET', '/api/roles');
+        if (!d.assignments.length) return console.log('No role assignments yet.');
+        console.log(pad('EMAIL', 34) + 'ROLE');
+        return d.assignments.forEach(a => console.log(pad(a.email, 34) + a.name));
+      }
+      if (action === 'grant') {
+        if (!role) return die('usage: jc roles grant <email> <owner|contributor|useradmin>');
+        await api('PUT', '/api/roles', { email, role });
+        return console.log(`${email} → ${role}`);
+      }
+      if (action === 'revoke') {
+        if (!email) return die('usage: jc roles revoke <email>');
+        await api('DELETE', `/api/roles/${encodeURIComponent(email)}`);
+        return console.log(`Revoked ${email}`);
+      }
+      return die('usage: jc roles [list | grant <email> <role> | revoke <email>]');
+    }
+    case 'activity': {
+      const rows = await api('GET', `/api/activity?limit=${Number(flags.limit) || 50}`);
+      if (!rows.length) return console.log('Nothing recorded yet.');
+      console.log(pad('WHEN', 24) + pad('WHO', 26) + pad('ACTION', 14) + pad('APP', 18) + 'DETAIL');
+      return rows.forEach(e => console.log(
+        pad(new Date(e.at).toLocaleString(), 24) + pad(e.by, 26) +
+        pad(e.action + (e.denied ? ' (refused)' : ''), 14) + pad(e.app || '-', 18) + (e.detail || '')));
+    }
+    case 'backup': {
+      // Same JSON the dashboard's ⬇ Backup downloads — including the key that decrypts env vars.
+      const file = rest[0] || `jerrick-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      const data = await api('GET', '/api/backup');
+      fs.writeFileSync(file, JSON.stringify(data, null, 2), { mode: 0o600 });
+      return console.log(`Wrote ${file} — ${(data.apps || []).length} app(s). Keep it safe: it decrypts your env vars.`);
     }
     case 'delete': case 'rm':
       if (!rest[0]) return die('usage: jc delete <name>');
@@ -188,6 +243,11 @@ function selfCheck() {
   const base = s => path.basename(String(s).replace(/\.git$/, '').replace(/[\/\\]+$/, ''));
   assert.equal(base('https://github.com/me/cool-app.git'), 'cool-app');
   assert.equal(base('C:/Users/me/my-app/'), 'my-app');
+  // Commands added after the CLI was first written are wired to real routes.
+  assert.deepEqual(parseArgs(['activity', '--limit', '10']), [['activity'], { limit: '10' }]);
+  assert.deepEqual(parseArgs(['roles', 'grant', 'a@b.com', 'contributor']), [['roles', 'grant', 'a@b.com', 'contributor'], {}]);
+  assert.deepEqual(parseArgs(['domains', 'app', 'add', 'x.example.com']), [['domains', 'app', 'add', 'x.example.com'], {}]);
+  for (const c of ['domains', 'roles', 'activity', 'backup']) assert.ok(HELP.includes('jc ' + c), c + ' is missing from help');
   console.log('self-check OK'); process.exit(0);
 }
 
