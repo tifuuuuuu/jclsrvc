@@ -744,11 +744,49 @@ function startMetricSampler() {
     checkAlert('memory', m.mem.pct);
     if (m.disk) checkAlert('disk', m.disk.pct);
     await sampleApps();
+    await sampleDisk();   // one app per tick — see DISK_INTERVAL
     saveMetrics();
   };
   sample();
   setInterval(sample, METRIC_INTERVAL).unref();
 }
+// ---- per-app disk usage ----
+// Plans cap memory, nothing caps disk, and the host disk alert can say "85%" without saying which app
+// got there. This measures what each app occupies — its working directory plus its stored log — so the
+// alert can name the culprit and the Metrics tab can show it.
+// ponytail: a recursive walk with a stat per file, so it is measured for ONE app per sampler tick and
+//   at most once every DISK_INTERVAL. Symlinks are skipped (isFile() is false for them), which also
+//   keeps a link loop from hanging the walk. Measure-and-report only — no quota, no enforcement.
+const DISK_INTERVAL = 10 * 60_000;   // how stale a per-app disk figure may get before it is re-walked
+const DISK_FILE_CAP = 50_000;        // stop walking past this many files; the figure is then a floor
+const appDisk = new Map();           // name -> { bytes, at, capped }
+
+async function dirSize(dir, budget) {
+  let entries;
+  try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch (_) { return 0; } // gone or unreadable
+  let total = 0;
+  for (const e of entries) {
+    if (budget.files <= 0) break;
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) total += await dirSize(p, budget);
+    else if (e.isFile()) { budget.files--; try { total += (await fs.promises.stat(p)).size; } catch (_) {} }
+  }
+  return total;
+}
+
+// One app per call: the stalest one that is due. With N apps every app is refreshed every
+// max(DISK_INTERVAL, N * METRIC_INTERVAL), and a tick never walks more than one tree.
+async function sampleDisk() {
+  const now = Date.now();
+  const due = apps.find(a => { const p = appDisk.get(a.name); return !p || now - p.at > DISK_INTERVAL; });
+  if (!due) return;
+  const budget = { files: DISK_FILE_CAP };
+  let bytes = due.cwd ? await dirSize(due.cwd, budget) : 0;
+  try { bytes += fs.statSync(logFile(due.name)).size; } catch (_) {} // stored logs count against the box too
+  appDisk.set(due.name, { bytes, at: Date.now(), capped: budget.files <= 0 });
+}
+const diskOf = name => (appDisk.get(name) || {}).bytes ?? null;
+
 // Per-app RSS/CPU history + plan memory-cap enforcement (restart an app that overruns its plan for 3 samples).
 async function sampleApps() {
   for (const a of apps) {
@@ -861,8 +899,14 @@ function checkAlert(resource, pct) {
   if (pct < ALERT_PCT || Date.now() - (lastAlert[resource] || 0) < ALERT_EVERY) return;
   lastAlert[resource] = Date.now();
   const to = process.env.NOTIFY_TO || process.env.GMAIL_USER;
-  if (to) sendMail(to, `[Jerrick Cloud] ${resource} at ${pct}%`,
-    `Host ${resource} usage is ${pct}% (alert threshold ${ALERT_PCT}%).\nFree up ${resource} on your Jerrick Cloud server.`, null);
+  if (!to) return;
+  // Name the biggest apps on a disk alert — "85% full" is not actionable on its own.
+  const top = resource === 'disk'
+    ? [...appDisk].filter(([, d]) => d.bytes).sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 3)
+    : [];
+  const largest = top.length ? '\n\nLargest apps on disk:\n' + top.map(([n, d]) => `  ${n} — ${(d.bytes / 1048576).toFixed(0)} MB`).join('\n') : '';
+  sendMail(to, `[Jerrick Cloud] ${resource} at ${pct}%`,
+    `Host ${resource} usage is ${pct}% (alert threshold ${ALERT_PCT}%).\nFree up ${resource} on your Jerrick Cloud server.${largest}`, null);
 }
 
 // "[D-]H:MM:SS" (win tasklist) / "[DD-]HH:MM:SS" (unix ps) cumulative CPU time -> ms, or null.
@@ -1221,7 +1265,7 @@ const assistantTools = visible => [
       return JSON.stringify({
         ...insights(app, { q: q || '', level: level || 'error', limit: 40 }),
         plan: app.size || 'free', planMemMb: planMem(app.size),
-        rss: last.rss ?? null, cpu: last.cpu ?? null, sampledAt: last.ts ?? null,
+        rss: last.rss ?? null, cpu: last.cpu ?? null, sampledAt: last.ts ?? null, diskBytes: diskOf(app.name),
         uptimeSec: app.startedAt && app.status === 'running' ? Math.round((Date.now() - new Date(app.startedAt)) / 1000) : 0,
         source: app.source, url: app.url, port: app.port, runtime: app.runtime || null,
         healthPath: app.healthPath || null, desired: app.desired,
@@ -1538,7 +1582,7 @@ const handler = async (req, res) => {
       const st = await pidStat(app.pid);
       const cpu = pidCpuPct(app.name, app.pid, st.cpuMs);
       const uptimeSec = app.startedAt && app.status === 'running' ? Math.round((Date.now() - new Date(app.startedAt)) / 1000) : 0;
-      return json(res, { status: app.status, health: app.health || 'unknown', rss: st.rss, cpu, uptimeSec, restarts: app.restarts || 0, memMb: planMem(app.size) });
+      return json(res, { status: app.status, health: app.health || 'unknown', rss: st.rss, cpu, uptimeSec, restarts: app.restarts || 0, memMb: planMem(app.size), disk: diskOf(app.name) });
     }
 
     if (req.method === 'PUT' && parts[3] === 'env' && parts.length === 4) {
@@ -1948,6 +1992,19 @@ if (process.argv.includes('--check')) {
     await _acts[0].run({ name: 'demo', reason: 'wedged again' });          // same action+app -> no duplicate button
     assert.ok((await _acts[0].run({ name: 'nope', reason: 'x' })).startsWith('No app named'));
     assert.deepEqual(_pending, [{ action: 'restart', name: 'demo', reason: 'wedged' }]);
+    // Per-app disk: a recursive walk that adds up real files at every depth, survives an unreadable
+    // path, and stops at the file budget rather than walking a pathological tree forever.
+    const _ddir = fs.mkdtempSync(path.join(os.tmpdir(), 'jc-du-'));
+    fs.mkdirSync(path.join(_ddir, 'sub', 'deep'), { recursive: true });
+    fs.writeFileSync(path.join(_ddir, 'a.txt'), 'x'.repeat(100));
+    fs.writeFileSync(path.join(_ddir, 'sub', 'b.txt'), 'y'.repeat(250));
+    fs.writeFileSync(path.join(_ddir, 'sub', 'deep', 'c.txt'), 'z'.repeat(650));
+    assert.equal(await dirSize(_ddir, { files: 50 }), 1000);
+    assert.equal(await dirSize(path.join(_ddir, '__nope__'), { files: 50 }), 0);   // missing dir -> 0, no throw
+    const _capped = await dirSize(_ddir, { files: 1 });
+    assert.ok(_capped > 0 && _capped < 1000);                                      // budget stops the walk early
+    fs.rmSync(_ddir, { recursive: true, force: true });
+    assert.equal(diskOf('__no_such_app__'), null);                                 // never measured -> null, not 0
     console.log('self-check OK'); process.exit(0);
   });
 } else {
