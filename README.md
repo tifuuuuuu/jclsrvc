@@ -54,7 +54,8 @@ node server.js --check    # run the self-checks
 - **Auto-diagnosis on failure** — when an app gives up (a crash-loop, or a deploy that dies with nothing left serving), the assistant runs itself: it reads that app's logs, metrics, deploy history and the host's memory/disk, then writes the root cause — what broke, the log line that proves it, the fix — into **Application Insights → Why it failed**. The log stream gets a one-line pointer; the diagnosis is stored, survives a restart, and clears the moment the app runs again. Nobody has to be watching, and it never touches the app. Same `ANTHROPIC_API_KEY` as the Assistant tab; unset → the app just fails quietly like before.
 - **Application Insights tab** — everything the app has logged is stored on disk (`logs/<app>.log`, survives restarts) and searchable here: substring search, filter by error / warning / info, and the values to check when something breaks — errors and warnings logged, last error, restarts, requests seen, failed requests, avg + p95 response time, peak memory / CPU, and a table of recent 4xx/5xx requests through the proxy. Full log downloadable.
 - **Metrics tab** — this app's process memory / CPU / uptime / restarts / health, what it occupies on disk (its working directory plus its stored log), plus live host memory & disk with sparklines and a sample log. Per-app history is sampled and persisted.
-- **Threshold alerts** — emails when host memory or disk crosses 85% (set `ALERT_PCT` to change). A disk alert names the three largest apps, so the mail says which one to go look at. Reuses the SMTP config below.
+- **Threshold alerts** — emails when host memory or disk crosses 85% (set `ALERT_PCT` to change). A disk alert names the three largest apps, so the message says which one to go look at. Reuses the SMTP config below.
+- **Webhook notifications** — set `NOTIFY_WEBHOOK` and every deploy result and threshold alert is also POSTed there as JSON. The body carries both `text` and `content`, so the same URL works for Slack or Discord without configuring which; `subject`, `body` and `source` are there for anything custom. Independent of email — either, both, or neither can be configured.
 
 **Networking**
 - **Custom domains** — map a hostname to an app (Custom domains tab); point its DNS here and the proxy routes it.
@@ -70,6 +71,7 @@ node server.js --check    # run the self-checks
 | `SUBSCRIPTION_OWNER` | Email that holds the Owner role. Unset → the first person to sign in claims it. |
 | `ORG_DOMAIN` | Mail domain roles may be granted within. Unset → the owner's own domain. |
 | `GMAIL_USER` / `GMAIL_APP_PASS` / `NOTIFY_TO` | SMTP for deploy + threshold-alert emails. |
+| `NOTIFY_WEBHOOK` | URL to POST the same notifications to as JSON (Slack / Discord / anything). |
 | `ALERT_PCT` | Memory/disk alert threshold percent (default 85). |
 | `SSL_CERT` / `SSL_KEY` | Paths to a cert/key pair → serve over HTTPS. |
 | `JC_SECRET` | Key for env-var-at-rest encryption. Unset → a random key is generated and stored in `logs/.secret`. |

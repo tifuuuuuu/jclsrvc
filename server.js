@@ -352,18 +352,41 @@ function setStatus(name, status) {
   if (status === 'failed') diagnose(a); // async, fire-and-forget: ask Claude why, store the answer
 }
 
-// Who gets the email: the app's owner (set once Google login is wired up), else the configured fallback.
-const recipientFor = app => app.owner || process.env.NOTIFY_TO || process.env.GMAIL_USER;
+// ---- outbound notifications ----
+// Mail is not where people watch for a deploy any more. NOTIFY_WEBHOOK posts the same message to any
+// URL that accepts JSON. Slack reads "text", Discord reads "content", so sending both keys makes one
+// body work for either without asking which you use; anything custom gets the structured fields.
+// Unset -> no-op, like every other integration here.
+// ponytail: fire-and-forget, one attempt, 5s timeout, no retry or queue. A missed notification must
+//   never hold up or fail a deploy — that is the whole trade.
+function postWebhook(subject, body) {
+  let u;
+  try { u = new URL(process.env.NOTIFY_WEBHOOK); } catch (_) { return; } // unset or unparseable -> nothing to do
+  const text = `${subject}\n${body}`;
+  const payload = JSON.stringify({ text, content: text, subject, body, source: 'jerrick-cloud' });
+  const lib = u.protocol === 'https:' ? https : http;
+  const req = lib.request(u, { method: 'POST', timeout: 5000,
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, res => res.resume());
+  req.on('timeout', () => req.destroy());
+  req.on('error', () => {}); // a notification that fails is not a deploy that fails
+  req.end(payload);
+}
+// One message out to every channel that is configured. Either can be unset; a failure in one never
+// touches the other, and neither ever throws into the caller.
+function notify(subject, body, { to, logName } = {}) {
+  postWebhook(subject, body);
+  const dest = to || process.env.NOTIFY_TO || process.env.GMAIL_USER; // the app's owner, else the configured fallback
+  if (dest) sendMail(dest, subject, body, logName);
+}
+
 
 function notifyDeploy(app, status) {
-  const to = recipientFor(app);
-  if (!to) return; // notifications not configured — no-op
   const live = status === 'running';
   const subject = `[Jerrick Cloud] ${app.name} ${live ? 'is live ✅' : 'failed to deploy ❌'}`;
   const body = live
     ? `${app.name} deployed successfully.\n\nLive at: ${app.url || 'n/a'}\nRuntime: ${app.runtime || 'n/a'}`
     : `${app.name} failed to deploy.\n\nOpen the Log stream in Jerrick Cloud for the build output.`;
-  sendMail(to, subject, body, app.name);
+  notify(subject, body, { to: app.owner, logName: app.name });
 }
 
 // Minimal SMTP-over-TLS sender for Gmail (smtp.gmail.com:465, implicit TLS). Configure via env:
@@ -898,15 +921,13 @@ function restore(data) {
 function checkAlert(resource, pct) {
   if (pct < ALERT_PCT || Date.now() - (lastAlert[resource] || 0) < ALERT_EVERY) return;
   lastAlert[resource] = Date.now();
-  const to = process.env.NOTIFY_TO || process.env.GMAIL_USER;
-  if (!to) return;
   // Name the biggest apps on a disk alert — "85% full" is not actionable on its own.
   const top = resource === 'disk'
     ? [...appDisk].filter(([, d]) => d.bytes).sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 3)
     : [];
   const largest = top.length ? '\n\nLargest apps on disk:\n' + top.map(([n, d]) => `  ${n} — ${(d.bytes / 1048576).toFixed(0)} MB`).join('\n') : '';
-  sendMail(to, `[Jerrick Cloud] ${resource} at ${pct}%`,
-    `Host ${resource} usage is ${pct}% (alert threshold ${ALERT_PCT}%).\nFree up ${resource} on your Jerrick Cloud server.${largest}`, null);
+  notify(`[Jerrick Cloud] ${resource} at ${pct}%`,
+    `Host ${resource} usage is ${pct}% (alert threshold ${ALERT_PCT}%).\nFree up ${resource} on your Jerrick Cloud server.${largest}`);
 }
 
 // "[D-]H:MM:SS" (win tasklist) / "[DD-]HH:MM:SS" (unix ps) cumulative CPU time -> ms, or null.
@@ -1793,6 +1814,13 @@ if (process.argv.includes('--check')) {
   // Notifications must be a safe no-op when unconfigured (no GMAIL_USER/PASS) — never throws.
   delete process.env.GMAIL_USER; delete process.env.GMAIL_APP_PASS;
   assert.doesNotThrow(() => notifyDeploy({ name: 'x', url: 'u' }, 'running'));
+  // Outbound notifications are a safe no-op unconfigured, and a junk webhook URL is ignored, not thrown.
+  delete process.env.NOTIFY_WEBHOOK;
+  assert.doesNotThrow(() => postWebhook('subject', 'body'));
+  assert.doesNotThrow(() => notify('subject', 'body'));
+  process.env.NOTIFY_WEBHOOK = 'not a url';
+  assert.doesNotThrow(() => postWebhook('subject', 'body'));
+  delete process.env.NOTIFY_WEBHOOK;
   // Cookie parsing: split on the first '=' so hex session ids survive intact.
   assert.equal(parseCookies({ headers: { cookie: 'a=1; jc_session=deadbeef' } }).jc_session, 'deadbeef');
   // Persistence is a safe no-op when unconfigured (no MONGODB_URI) — never throws, never loads the driver.
